@@ -1,0 +1,59 @@
+# Tandem and its camera extension, built by Xcode so it can sign them with a developer account
+# (a camera extension needs Apple-issued signing). Generate with xcodegen; build.sh does both.
+#
+# The team and bundle identifier come from the environment (TANDEM_TEAM, TANDEM_BUNDLE_ID), which
+# build.sh and release.sh fill from Support/team and Support/bundle-id.
+name: Tandem
+options:
+  deploymentTarget:
+    macOS: "11.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: ${TANDEM_TEAM}
+    TANDEM_BUNDLE_ID: ${TANDEM_BUNDLE_ID}
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    MARKETING_VERSION: "1.2.1"
+    CURRENT_PROJECT_VERSION: "1"
+    ARCHS: "arm64 x86_64"
+    ONLY_ACTIVE_ARCH: NO
+    GENERATE_INFOPLIST_FILE: NO
+targets:
+  Tandem:
+    type: application
+    platform: macOS
+    sources:
+      - App
+      - Sender
+      - Receiver
+      - Shared
+      - path: Resources/Tandem.icns
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_NAME: Tandem
+        PRODUCT_BUNDLE_IDENTIFIER: ${TANDEM_BUNDLE_ID}
+        INFOPLIST_FILE: Support/Tandem-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Support/Tandem.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: Sender/CGVirtualDisplay.h
+    dependencies:
+      - target: TandemCamera
+        embed: true
+  TandemCamera:
+    type: system-extension
+    platform: macOS
+    sources:
+      - Camera
+      - Shared/Wire.swift
+      - Shared/Machine.swift
+      - Shared/CameraLink.swift
+    settings:
+      base:
+        PRODUCT_NAME: ${TANDEM_BUNDLE_ID}.Camera
+        PRODUCT_BUNDLE_IDENTIFIER: ${TANDEM_BUNDLE_ID}.Camera
+        INFOPLIST_FILE: Support/Camera-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Support/Camera.entitlements
+        SKIP_INSTALL: YES
+        MACOSX_DEPLOYMENT_TARGET: "12.3"
