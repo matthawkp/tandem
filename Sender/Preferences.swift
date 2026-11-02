@@ -71,6 +71,19 @@ final class Preferences {
         get { defaults.string(forKey: "cameraPace").flatMap(CameraSwitcher.Pace.init) ?? .balanced }
         set { defaults.set(newValue.rawValue, forKey: "cameraPace") }
     }
+    /// The other Mac's camera is tinted to match this one's colour.
+    var cameraMatchesColour: Bool {
+        get { bool("cameraMatchesColour", true) }
+        set { defaults.set(newValue, forKey: "cameraMatchesColour") }
+    }
+    /// What it's tinted by: red, green and blue gains, learnt as you use it.
+    var cameraColourGains: SIMD3<Double> {
+        get {
+            guard let values = defaults.array(forKey: "cameraColourGains") as? [Double], values.count == 3 else { return .one }
+            return SIMD3(values[0], values[1], values[2])
+        }
+        set { defaults.set([newValue.x, newValue.y, newValue.z], forKey: "cameraColourGains") }
+    }
     /// Tandem Camera is installed for other apps to use.
     var offersCamera: Bool {
         get { bool("offersCamera", true) }

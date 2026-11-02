@@ -46,6 +46,9 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private static let minimumFacing = 0.35
     private static let fadeDuration = 0.35
     private static let analysisInterval = 0.15
+    /// How often each camera's view of your skin is measured, for matching colour.
+    private static let skinInterval = 0.5
+    private static let linear = CGColorSpace(name: CGColorSpace.linearSRGB)!
 
     /// On the main thread.
     var onStatus: (Status) -> Void = { _ in }
@@ -77,11 +80,19 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     private var outputTimer: DispatchSourceTimer?
     private var lastStatus = DispatchTime(uptimeNanoseconds: 0)
     private var frameCount = 0
+    /// Red, green and blue gains that make the other Mac's camera match this one's colour,
+    /// learnt from your face whenever both cameras see it.
+    private var matchesColour = true
+    private var remoteGains = Preferences.shared.cameraColourGains
+    private var skin: [Source: (colour: SIMD3<Double>, at: DispatchTime)] = [:]
+    private var lastSkin: [Source: DispatchTime] = [:]
+    private var lastGainsSaved = DispatchTime.now()
 
-    func start(mode: Mode, pace: Pace) {
+    func start(mode: Mode, pace: Pace, matchesColour: Bool) {
         queue.async {
             self.mode = mode
             self.pace = pace
+            self.matchesColour = matchesColour
             self.showing = mode.fixed ?? .remote
         }
         do {
@@ -109,6 +120,10 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     func setPace(_ pace: Pace) {
         queue.async { self.pace = pace }
+    }
+
+    func setMatchesColour(_ matches: Bool) {
+        queue.async { self.matchesColour = matches }
     }
 
     func setPreviewing(_ previewing: Bool) {
@@ -238,9 +253,71 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
             raw = max(0, 1 - (yaw * yaw + pitch * pitch).squareRoot() / 0.7)
         }
         sawFace[source] = face != nil
+        if let face, seconds(since: lastSkin[source]) >= CameraSwitcher.skinInterval {
+            lastSkin[source] = .now()
+            if let colour = skinColour(in: buffer, face: face.boundingBox) {
+                skin[source] = (colour, .now())
+                learnColour()
+            }
+        }
         // Smoothed, so one odd frame doesn't count for much.
         facing[source] = (facing[source] ?? raw) * 0.6 + raw * 0.4
     }
+
+    // MARK: Matching colour
+
+    /// The average colour of the middle of the face (cheeks, nose, forehead; not hair or
+    /// background), in linear light. Nil if it's too dark or too blown out to tell.
+    private func skinColour(in buffer: CVPixelBuffer, face: CGRect) -> SIMD3<Double>? {
+        let width = CGFloat(CVPixelBufferGetWidth(buffer)), height = CGFloat(CVPixelBufferGetHeight(buffer))
+        let box = CGRect(x: face.minX * width, y: face.minY * height, width: face.width * width, height: face.height * height)
+        let middle = box.insetBy(dx: box.width * 0.25, dy: box.height * 0.2)
+        guard middle.width >= 8, middle.height >= 8 else { return nil }
+        let average = CIImage(cvPixelBuffer: buffer).applyingFilter("CIAreaAverage", parameters: [kCIInputExtentKey: CIVector(cgRect: middle)])
+        var pixel = [Float](repeating: 0, count: 4)
+        ciContext.render(average, toBitmap: &pixel, rowBytes: 16, bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                         format: .RGBAf, colorSpace: CameraSwitcher.linear)
+        let colour = SIMD3(Double(pixel[0]), Double(pixel[1]), Double(pixel[2]))
+        guard colour.min() > 0.01, colour.max() < 0.9 else { return nil }
+        return colour
+    }
+
+    /// When both cameras have just seen your face, nudges the other Mac's gains towards making
+    /// your skin the same colour as this Mac's camera sees it. Colour only: each camera keeps its
+    /// own brightness. Slowly, so a passing shadow or a turn of the head doesn't show.
+    private func learnColour() {
+        guard let here = skin[.local], let there = skin[.remote],
+              seconds(since: here.at) < 2, seconds(since: there.at) < 2 else { return }
+        let luma = SIMD3(0.2126, 0.7152, 0.0722)
+        var gains = here.colour / there.colour
+        gains /= (gains * there.colour * luma).sum() / (there.colour * luma).sum()
+        gains = gains.clamped(lowerBound: SIMD3(repeating: 0.7), upperBound: SIMD3(repeating: 1.4))
+        remoteGains += (gains - remoteGains) * 0.08
+        if seconds(since: lastGainsSaved) > 10 {
+            lastGainsSaved = .now()
+            let saved = remoteGains
+            DispatchQueue.main.async { Preferences.shared.cameraColourGains = saved }
+        }
+    }
+
+    /// The gains to apply to the other Mac's pictures, if any.
+    private var colourGains: SIMD3<Double>? {
+        guard matchesColour, (remoteGains - 1).max() > 0.005 || (1 - remoteGains).max() > 0.005 else { return nil }
+        return remoteGains
+    }
+
+    /// A camera's picture, fitted to 1280×720 and, for the other Mac's, matched in colour.
+    private func picture(_ buffer: CVPixelBuffer, from source: Source) -> CIImage {
+        let image = fitted(CIImage(cvPixelBuffer: buffer))
+        guard source == .remote, let gains = colourGains else { return image }
+        return image.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: gains.x, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: gains.y, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: gains.z, w: 0),
+        ])
+    }
+
+    // MARK: Switching
 
     private func decide() {
         let now = DispatchTime.now()
@@ -280,12 +357,13 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     private func outputFrame() {
         publishStatus()
-        guard let frame = latest[showing]?.buffer ?? latest[showing.other]?.buffer else { return }
-        var image = fitted(CIImage(cvPixelBuffer: frame))
+        guard let (source, frame) = [showing, showing.other].lazy.compactMap({ source in self.latest[source].map { (source, $0.buffer) } }).first
+        else { return }
+        var image = picture(frame, from: source)
         if let fade = fadeFrom, let from = latest[fade.source]?.buffer {
             let t = seconds(since: fade.at) / CameraSwitcher.fadeDuration
             if t < 1 {
-                image = fitted(CIImage(cvPixelBuffer: from)).applyingFilter("CIDissolveTransition", parameters: [
+                image = picture(from, from: fade.source).applyingFilter("CIDissolveTransition", parameters: [
                     kCIInputTargetImageKey: image, kCIInputTimeKey: t * t * (3 - 2 * t),
                 ])
             } else {
@@ -293,7 +371,7 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
             }
         }
         var out: CVPixelBuffer?
-        if fadeFrom == nil, CVPixelBufferGetWidth(frame) == CameraSwitcher.width, CVPixelBufferGetHeight(frame) == CameraSwitcher.height {
+        if fadeFrom == nil, source == .local || colourGains == nil, CVPixelBufferGetWidth(frame) == CameraSwitcher.width, CVPixelBufferGetHeight(frame) == CameraSwitcher.height {
             out = frame
         } else if let pool {
             CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &out)

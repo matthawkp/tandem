@@ -15,6 +15,11 @@ final class CursorTracker {
     private let displayID: CGDirectDisplayID
     private let pixelWidth: Int
     private var timer: DispatchSourceTimer?
+    /// Keeps App Nap away while the other Mac shows the pointer. Tandem has no windows on
+    /// screen, so once you leave this Mac alone for a while, macOS would otherwise slow its
+    /// timers right down. The pointer would then stop following the other Mac's mouse until
+    /// this Mac's own trackpad woke Tandem up.
+    private var activity: NSObjectProtocol?
     private var lastPosition: CursorPosition?
     private var lastSeed: Int32?
     private var lastScale: CGFloat = 0
@@ -37,11 +42,15 @@ final class CursorTracker {
         timer.setEventHandler { [weak self] in self?.tick() }
         timer.resume()
         self.timer = timer
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+                                                         reason: "Showing the pointer on the other Mac")
     }
 
     func stop() {
         timer?.cancel()
         timer = nil
+        if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        activity = nil
     }
 
     /// A key was typed from the other Mac: an app may hide the pointer again, until it moves.

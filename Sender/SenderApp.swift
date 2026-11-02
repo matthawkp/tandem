@@ -36,7 +36,8 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setUpBrightnessKeys()
         camera.onChange = { [weak self] in self?.refresh() }
         if controller.prefs.offersCamera { camera.install() }
-        switcher.start(mode: controller.prefs.cameraMode, pace: controller.prefs.cameraPace)
+        switcher.start(mode: controller.prefs.cameraMode, pace: controller.prefs.cameraPace,
+                       matchesColour: controller.prefs.cameraMatchesColour)
 
         let prefs = controller.prefs
         if !prefs.hasLaunchedBefore {
@@ -266,6 +267,9 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         sub.addItem(.separator())
+        let match = toggle("Match Colours", prefs.cameraMatchesColour, #selector(toggleCameraColour))
+        match.toolTip = "Tints the \(peer)'s camera to match the \(this)'s, learnt from your face while both cameras see you."
+        sub.addItem(match)
         sub.addItem(self.item("Show Camera Preview…", #selector(showCameraPreview)))
         sub.addItem(.separator())
         let offer = toggle("Offer Tandem Camera to Apps", prefs.offersCamera, #selector(toggleCamera))
@@ -298,6 +302,11 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let pace = (item.representedObject as? String).flatMap(CameraSwitcher.Pace.init) else { return }
         controller.prefs.cameraPace = pace
         switcher.setPace(pace)
+    }
+
+    @objc private func toggleCameraColour() {
+        controller.prefs.cameraMatchesColour.toggle()
+        switcher.setMatchesColour(controller.prefs.cameraMatchesColour)
     }
 
     @objc private func showCameraPreview() {
