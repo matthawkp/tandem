@@ -53,7 +53,9 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
 
     private let queue = DispatchQueue(label: "switcher", qos: .userInteractive)
     private let ciContext = CIContext()
+    /// Separate pools, so a frame being shown is never refilled with the other camera's picture.
     private let pool = makeBGRAPool(width: CameraSwitcher.width, height: CameraSwitcher.height)
+    private let remotePool = makeBGRAPool(width: CameraSwitcher.width, height: CameraSwitcher.height)
     private var listener: NWListener?
 
     // On `queue`.
@@ -160,7 +162,7 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
         if uses(.remote) {
             let link = CameraLink(.display, queue: queue)
             link.onFrame = { [weak self] body in
-                guard let self, let pool = self.pool, let buffer = pixelBuffer(fromCameraFrame: body, pool: pool) else { return }
+                guard let self, let pool = self.remotePool, let buffer = pixelBuffer(fromCameraFrame: body, pool: pool) else { return }
                 self.arrived(buffer, from: .remote)
             }
             link.start()

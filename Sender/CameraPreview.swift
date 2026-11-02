@@ -8,6 +8,8 @@ final class CameraPreview: NSObject, NSWindowDelegate {
     private let picture = NSView()
     private let status = NSTextField(labelWithString: "Starting the cameras…")
     private let switcher: CameraSwitcher
+    /// The frames on screen, kept so their buffers aren't reused while showing.
+    private var shown: [CVPixelBuffer] = []
 
     init(switcher: CameraSwitcher) {
         self.switcher = switcher
@@ -45,7 +47,13 @@ final class CameraPreview: NSObject, NSWindowDelegate {
 
     func show() {
         switcher.onFrame = { [weak self] buffer in
-            self?.picture.layer?.contents = CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue()
+            guard let self else { return }
+            // Hold on to the last few frames: the layer only keeps the IOSurface, so a released
+            // buffer would go back to its pool and be refilled (sometimes with the other camera's
+            // picture) while it's still on screen, flashing for a frame.
+            self.shown.append(buffer)
+            if self.shown.count > 3 { self.shown.removeFirst() }
+            self.picture.layer?.contents = CVPixelBufferGetIOSurface(buffer)?.takeUnretainedValue()
         }
         switcher.onStatus = { [weak self] status in self?.show(status) }
         switcher.setPreviewing(true)
@@ -79,5 +87,7 @@ final class CameraPreview: NSObject, NSWindowDelegate {
         switcher.setPreviewing(false)
         switcher.onFrame = { _ in }
         switcher.onStatus = { _ in }
+        picture.layer?.contents = nil
+        shown = []
     }
 }
