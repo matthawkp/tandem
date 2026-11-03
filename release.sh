@@ -9,7 +9,7 @@ set -euo pipefail
 cd "${0:A:h}"
 
 PROFILE=tandem
-VERSION=1.2.3
+VERSION=1.2.4
 BUILD=$(date +%Y%m%d%H%M)
 TEAM=${TANDEM_TEAM:-$(cat Support/team 2>/dev/null || true)}
 [[ -n $TEAM ]] || { echo "Put your Apple Developer team ID in Support/team"; exit 1; }

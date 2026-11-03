@@ -247,10 +247,21 @@ final class InputPlayer {
         let from = pointer
         let to = CGPoint(x: from.x + dx, y: from.y + dy)
         if display(at: to) != nil { return to }
-        // Off every screen: slide along the edge of the one it's on.
-        guard let id = display(at: from) else { return from }
-        let bounds = CGDisplayBounds(id)
+        // Off every screen: slide along the edge of the one it's on. It may already be off them
+        // all, as posted events aren't kept on screen and another app's can leave it out there;
+        // then it comes back to the nearest, or it would stay out there, unseen, for good.
+        guard let bounds = display(at: from).map(CGDisplayBounds) ?? InputPlayer.nearestScreen(to: to) else { return from }
         return CGPoint(x: min(max(to.x, bounds.minX), bounds.maxX - 1), y: min(max(to.y, bounds.minY), bounds.maxY - 1))
+    }
+
+    private static func nearestScreen(to point: CGPoint) -> CGRect? {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(UInt32(ids.count), &ids, &count) == .success else { return nil }
+        func distance(_ rect: CGRect) -> CGFloat {
+            hypot(max(rect.minX - point.x, 0, point.x - rect.maxX), max(rect.minY - point.y, 0, point.y - rect.maxY))
+        }
+        return ids.prefix(Int(count)).map { CGDisplayBounds($0) }.min { distance($0) < distance($1) }
     }
 
     private func display(at point: CGPoint) -> CGDirectDisplayID? {
