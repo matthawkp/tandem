@@ -68,8 +68,11 @@ enum CrashGuard {
         watchdog.schedule(deadline: .now() + 1, repeating: 1)
         watchdog.setEventHandler {
             // Uptime, which stands still while the Mac sleeps: that isn't a hang.
-            let (holding, silent, alreadyRescued) = lock.withLock {
-                (held, Double(DispatchTime.now().uptimeNanoseconds - lastBeat.uptimeNanoseconds) / 1e9, rescued)
+            let (holding, silent, alreadyRescued) = lock.withLock { () -> (Hold, Double, Bool) in
+                // The beat's time first: it's set up the first time it's read, which could be
+                // here, and would then be later than a "now" taken before it.
+                let last = lastBeat.uptimeNanoseconds, now = DispatchTime.now().uptimeNanoseconds
+                return (held, now > last ? Double(now - last) / 1e9 : 0, rescued)
             }
             guard holding != .nothing, silent > rescueAfter else { return }
             if !alreadyRescued {
