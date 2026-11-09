@@ -46,13 +46,6 @@ final class InputCapture {
     /// The click that started control doesn't go to the MacBook, so neither does its release.
     private var holdsBackMouseUp = false
 
-    static var hasAccessibility: Bool { AXIsProcessTrusted() }
-
-    static func requestAccessibility() {
-        let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
-    }
-
     init(window: NSWindow, hud: InputHUD) {
         self.window = window
         self.hud = hud
@@ -87,8 +80,10 @@ final class InputCapture {
         // The iMac's own pointer stays put, and its movements go to the MacBook's.
         CGAssociateMouseAndMouseCursorPosition(0)
         window.acceptsMouseMovedEvents = true
+        CrashGuard.holding = .pointer
         if NSApp.presentationOptions.contains(.hideDock) {
             NSApp.presentationOptions.formUnion(Self.lockedDown)
+            CrashGuard.holding = .everything
         }
         tap.watch([.keyDown, .keyUp, .flagsChanged, .mouseMoved, .scrollWheel, EventTap.systemDefined]
                   + EventTap.buttons + EventTap.drags)
@@ -106,6 +101,7 @@ final class InputCapture {
         tap.stop()
         CGAssociateMouseAndMouseCursorPosition(1)
         NSApp.presentationOptions.subtract(Self.lockedDown)
+        CrashGuard.holding = .nothing
         if !quietly {
             hud.show("Keyboard and mouse are back on this \(Machine.kind)", "Click to control your \(peerKind) again.")
             onLocalMouse()

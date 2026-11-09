@@ -94,6 +94,8 @@ func cameraFrameBody(_ buffer: CVPixelBuffer) -> Data? {
 func pixelBuffer(fromCameraFrame body: Data, pool: CVPixelBufferPool) -> CVPixelBuffer? {
     guard body.count >= 8 else { return nil }
     let width = Int(body.readLE(UInt32.self, at: 0)), height = Int(body.readLE(UInt32.self, at: 4))
+    // Checked before they're multiplied: sizes from outside could otherwise overflow.
+    guard (1...Wire.maxDimension).contains(width), (1...Wire.maxDimension).contains(height) else { return nil }
     var buffer: CVPixelBuffer?
     CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
     guard let buffer, body.count == 8 + width * height * 4,

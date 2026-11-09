@@ -56,6 +56,13 @@ final class TileEncoder {
     private let previous: UnsafeMutableRawPointer
     private var previousStride: Int { width * 4 }
     private var needsFullFrame = true
+    /// `previous` is the CPU's copy of what was last sent, for comparing frames on the CPU. While
+    /// the GPU does the comparing (it keeps a copy of its own) nothing reads it, and keeping it
+    /// up would copy every changed tile, 59 MB a frame for full-screen video. So it's left to
+    /// go stale then, and if the CPU ever has to take over, it starts with a whole frame.
+    /// The debugging switches that read it keep it up regardless.
+    private var previousIsStale = false
+    private let alwaysKeepsPrevious = debugEnabled || checkDiff
     private let bc7: BC7Encoder?
     private let differ: TileDiffer?
 
@@ -115,22 +122,24 @@ final class TileEncoder {
         return dirty
     }
 
-    /// Which tiles changed: on the GPU for captured frames, on the CPU otherwise.
-    private func changedTiles(_ frame: Frame, full: Bool) -> [Bool] {
+    /// Which tiles changed, and whether the GPU worked that out: it does for captured frames,
+    /// the CPU otherwise.
+    private func changedTiles(_ frame: Frame, full: Bool) -> (dirty: [Bool], onGPU: Bool) {
+        let everything = [Bool](repeating: true, count: columns * bands)
+        // The CPU compares against its own copy, which is no use once it's stale.
+        func onCPU() -> [Bool] { full || previousIsStale ? everything : changedTilesOnCPU(frame) }
         guard case .pixelBuffer(let buffer) = frame.source, let differ else {
             differ?.reset()
-            return full ? [Bool](repeating: true, count: columns * bands) : changedTilesOnCPU(frame)
+            return (onCPU(), false)
         }
         // The GPU keeps its own copy of the last frame, so it sees every frame, even full ones.
-        guard let gpu = differ.changedTiles(buffer) else {
-            return full ? [Bool](repeating: true, count: columns * bands) : changedTilesOnCPU(frame)
-        }
-        if checkDiff && !full {
+        guard let gpu = differ.changedTiles(buffer) else { return (onCPU(), false) }
+        if checkDiff && !full && !previousIsStale {
             // TANDEM_CHECK_DIFF: the CPU's answer, which must match.
             let cpu = changedTilesOnCPU(frame)
             if cpu != gpu { log("GPU comparison differs from the CPU's in \(zip(cpu, gpu).filter { $0 != $1 }.count) tiles") }
         }
-        return full ? [Bool](repeating: true, count: columns * bands) : gpu
+        return (full ? everything : gpu, true)
     }
 
     /// Returns a frame message body, or nil if nothing needs sending.
@@ -140,7 +149,7 @@ final class TileEncoder {
         let base = frame.base, stride = frame.stride
 
         // 1. Which tiles changed.
-        let dirty = changedTiles(frame, full: full)
+        let (dirty, comparedOnGPU) = changedTiles(frame, full: full)
 
         // 2. Lossless or BC7 for each changed tile, and which lossy tiles to make sharp again.
         var kinds = [Kind](repeating: .none, count: columns * bands)
@@ -180,15 +189,21 @@ final class TileEncoder {
             lossy[t] = nowLossy
         }
 
-        // 3. Remember what's being sent.
-        DispatchQueue.concurrentPerform(iterations: bands) { band in
-            let y0 = band * tileHeight, h = min(tileHeight, height - y0)
-            for column in 0..<columns where dirty[band * columns + column] {
-                let x0 = column * tileWidth, rowBytes = min(tileWidth, width - x0) * 4
-                for row in 0..<h {
-                    memcpy(previous + (y0 + row) * previousStride + x0 * 4, base + (y0 + row) * stride + x0 * 4, rowBytes)
+        // 3. Remember what's being sent, unless the GPU is doing the remembering.
+        if comparedOnGPU && !alwaysKeepsPrevious {
+            previousIsStale = true
+        } else {
+            DispatchQueue.concurrentPerform(iterations: bands) { band in
+                let y0 = band * tileHeight, h = min(tileHeight, height - y0)
+                for column in 0..<columns where dirty[band * columns + column] {
+                    let x0 = column * tileWidth, rowBytes = min(tileWidth, width - x0) * 4
+                    for row in 0..<h {
+                        memcpy(previous + (y0 + row) * previousStride + x0 * 4, base + (y0 + row) * stride + x0 * 4, rowBytes)
+                    }
                 }
             }
+            // Stale until now, every tile was counted as changed, so every tile was just copied.
+            previousIsStale = false
         }
 
         // 4. Encode: BC7 tiles on the GPU while the CPU compresses the lossless ones.

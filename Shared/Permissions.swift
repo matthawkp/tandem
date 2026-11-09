@@ -67,8 +67,7 @@ enum Permission: String, CaseIterable, Identifiable {
             CGRequestScreenCaptureAccess()
             openSettings("Privacy_ScreenCapture")
         case .accessibility:
-            let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-            AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
+            Accessibility.prompt()
             openSettings("Privacy_Accessibility")
         case .camera:
             if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {

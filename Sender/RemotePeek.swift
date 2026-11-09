@@ -65,7 +65,7 @@ final class RemotePeek {
     /// Where the other Mac's pointer finished, as fractions of its screen: this Mac's carries on
     /// from the same place on the picture.
     func pointer(at x: Float, _ y: Float) {
-        guard let id = displayID() else { return }
+        guard x.isFinite, y.isFinite, let id = displayID() else { return }
         let bounds = CGDisplayBounds(id)
         CGWarpMouseCursorPosition(CGPoint(x: bounds.minX + CGFloat(min(max(x, 0), 0.999)) * bounds.width,
                                           y: bounds.minY + CGFloat(min(max(y, 0), 0.999)) * bounds.height))
@@ -272,6 +272,7 @@ final class RemotePeek {
         let drives = drivesNow
         CGAssociateMouseAndMouseCursorPosition(drives ? 0 : 1)
         setPointerHidden(drives)
+        CrashGuard.holding = drives ? .pointer : .nothing
         if !drives, wasDriving { sendInput(InputEvent(type: InputEvent.releaseAll)) }
         wasDriving = drives
     }

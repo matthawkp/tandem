@@ -61,7 +61,9 @@ final class InputPlayer {
         let flags = CGEventFlags(rawValue: input.flags)
         switch type {
         case .keyDown, .keyUp, .flagsChanged:
-            let code = UInt16(input[CGEventField.keyboardEventKeycode.rawValue])
+            // Numbers from the other Mac are checked as they're read: one that doesn't fit drops
+            // the event, rather than stopping the app.
+            guard let code: UInt16 = input.integer(CGEventField.keyboardEventKeycode.rawValue) else { return }
             // Apple keyboards' brightness keys arrive as key codes as well as media keys.
             if code == 144 || code == 145, type != .flagsChanged {
                 let direction: Float = code == 144 ? 1 : -1
@@ -76,7 +78,7 @@ final class InputPlayer {
             guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: type != .keyUp) else { return }
             event.type = type
             event.flags = flags
-            event.setIntegerValueField(.keyboardEventAutorepeat, value: Int64(input[CGEventField.keyboardEventAutorepeat.rawValue]))
+            event.setIntegerValueField(.keyboardEventAutorepeat, value: input.integer(CGEventField.keyboardEventAutorepeat.rawValue) ?? 0)
             if type == .keyDown {
                 keysDown.insert(code)
                 pointerMayBeHidden = true
@@ -87,12 +89,14 @@ final class InputPlayer {
             event.post(tap: .cghidEventTap)
 
         case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-            revealPointerIfNeeded()
             let dx = input[CGEventField.mouseEventDeltaX.rawValue] * tuning.pointerSpeed
             let dy = input[CGEventField.mouseEventDeltaY.rawValue] * tuning.pointerSpeed
+            guard dx.isFinite, dy.isFinite, let button: UInt32 = input.integer(CGEventField.mouseEventButtonNumber.rawValue)
+            else { return }
+            revealPointerIfNeeded()
             let to = movedPointer(by: dx, dy)
             guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: to,
-                                      mouseButton: CGMouseButton(rawValue: UInt32(input[CGEventField.mouseEventButtonNumber.rawValue])) ?? .left)
+                                      mouseButton: CGMouseButton(rawValue: button) ?? .left)
             else { return }
             event.flags = flags
             event.setDoubleValueField(.mouseEventDeltaX, value: dx)
@@ -100,17 +104,17 @@ final class InputPlayer {
             event.post(tap: .cghidEventTap)
 
         case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
+            guard let button: UInt32 = input.integer(CGEventField.mouseEventButtonNumber.rawValue) else { return }
             revealPointerIfNeeded()
-            let button = Int64(input[CGEventField.mouseEventButtonNumber.rawValue])
             guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: pointer,
-                                      mouseButton: CGMouseButton(rawValue: UInt32(button)) ?? .left)
+                                      mouseButton: CGMouseButton(rawValue: button) ?? .left)
             else { return }
             event.flags = flags
-            event.setIntegerValueField(.mouseEventClickState, value: Int64(input[CGEventField.mouseEventClickState.rawValue]))
+            event.setIntegerValueField(.mouseEventClickState, value: input.integer(CGEventField.mouseEventClickState.rawValue) ?? 1)
             if [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type) {
-                buttonsDown.insert(button)
+                buttonsDown.insert(Int64(button))
             } else {
-                buttonsDown.remove(button)
+                buttonsDown.remove(Int64(button))
             }
             event.post(tap: .cghidEventTap)
 
@@ -120,7 +124,7 @@ final class InputPlayer {
             event.flags = flags
             event.location = pointer
             for field in InputEvent.scrollFields {
-                guard var value = input.fields[field.rawValue] else { continue }
+                guard var value = input.fields[field.rawValue], value.isFinite else { continue }
                 if InputEvent.scrollDeltaFields.contains(field) {
                     value *= tuning.scrollSpeed * (tuning.reversesScrolling ? -1 : 1)
                     // Whole-line steps from a mouse wheel shouldn't round away to nothing.
@@ -131,7 +135,7 @@ final class InputPlayer {
                 if InputEvent.doubleFields.contains(field) {
                     event.setDoubleValueField(field, value: value)
                 } else {
-                    event.setIntegerValueField(field, value: Int64(value))
+                    event.setIntegerValueField(field, value: Int64(exactly: value.rounded(.towardZero)) ?? 0)
                 }
             }
             event.post(tap: .cghidEventTap)
@@ -140,8 +144,8 @@ final class InputPlayer {
             // Media keys: volume, play/pause, brightness (which Tandem's own brightness keys then
             // send to whichever screen the pointer is on).
             guard input.type == 14 else { return } // NX_SYSDEFINED
-            let data1 = Int(input[InputEvent.data1Field]), data2 = Int(input[InputEvent.data2Field])
-            let subtype = Int16(input[InputEvent.subtypeField])
+            guard let data1: Int = input.integer(InputEvent.data1Field), let data2: Int = input.integer(InputEvent.data2Field),
+                  let subtype: Int16 = input.integer(InputEvent.subtypeField) else { return }
             DispatchQueue.main.async {
                 let key = (data1 & 0xFFFF_0000) >> 16
                 let brightnessUp = 2, brightnessDown = 3 // NX_KEYTYPE_BRIGHTNESS_UP / _DOWN

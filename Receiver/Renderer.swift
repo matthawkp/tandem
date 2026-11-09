@@ -93,24 +93,35 @@ final class Renderer {
         clear()
     }
 
-    /// Decodes and presents a frame, then calls `presented` with its number.
-    func apply(_ body: Data, presented: @escaping (UInt32) -> Void) {
-        queue.async { self.applyNow(body, presented: presented) }
+    /// Decodes and presents a frame, then calls `presented` with its number. A frame that makes
+    /// no sense is left out whole and `rejected` called instead: the sender's idea of what's on
+    /// screen is then wrong, and it waits for an answer to every frame, so the caller should
+    /// start the connection again rather than say nothing.
+    func apply(_ body: Data, presented: @escaping (UInt32) -> Void, rejected: @escaping () -> Void = {}) {
+        queue.async {
+            if let problem = self.applyNow(body, presented: presented) {
+                log(problem)
+                rejected()
+            }
+        }
     }
 
     /// The MacBook's True Tone / Night Shift adaptation, applied to everything shown.
     func setColorMatrix(_ matrix: [Float]) {
         queue.async {
-            guard matrix.count == 9, matrix != self.colorMatrix else { return }
+            guard matrix.count == 9, matrix.allSatisfy(\.isFinite), matrix != self.colorMatrix else { return }
             self.colorMatrix = matrix
             self.present(nil, {})
         }
     }
 
-    private func applyNow(_ body: Data, presented: @escaping (UInt32) -> Void) {
-        guard body.count >= 8 else { return }
+    /// Nil, or what was wrong with the frame, in which case none of it was used.
+    private func applyNow(_ body: Data, presented: @escaping (UInt32) -> Void) -> String? {
+        guard body.count >= 8 else { return "frame of \(body.count) bytes is too short" }
         let frameNo = body.readLE(UInt32.self, at: 0)
         let count = Int(body.readLE(UInt32.self, at: 4))
+        // Each rect has a 13-byte header, so there can't be more than fit.
+        guard count <= (body.count - 8) / 13 else { return "frame \(frameNo) claims \(count) rects in \(body.count) bytes" }
         var rects: [Rect] = []
         rects.reserveCapacity(count)
         var offset = 8
@@ -118,7 +129,7 @@ final class Renderer {
         for _ in 0..<count {
             guard offset + 13 <= body.count,
                   let encoding = Wire.Encoding(rawValue: body[body.startIndex + offset + 8])
-            else { return log("bad rect header in frame \(frameNo)") }
+            else { return "bad rect header in frame \(frameNo)" }
             var r = Rect(x: Int(body.readLE(UInt16.self, at: offset)),
                          y: Int(body.readLE(UInt16.self, at: offset + 2)),
                          w: Int(body.readLE(UInt16.self, at: offset + 4)),
@@ -127,11 +138,16 @@ final class Renderer {
                          offset: offset + 13,
                          count: Int(body.readLE(UInt32.self, at: offset + 9)))
             guard r.x + r.w <= width, r.y + r.h <= height, r.offset + r.count <= body.count else {
-                return log("bad rect in frame \(frameNo)")
+                return "bad rect in frame \(frameNo)"
             }
             if r.encoding == .bc7 || r.encoding == .bc7lz4 {
-                guard supportsBC7, r.x % 4 == 0, r.y % 4 == 0, r.w % 4 == 0, r.h % 4 == 0 else {
-                    return log("unexpected BC7 rect in frame \(frameNo)")
+                guard supportsBC7, let staging, r.x % 4 == 0, r.y % 4 == 0, r.w % 4 == 0, r.h % 4 == 0 else {
+                    return "unexpected BC7 rect in frame \(frameNo)"
+                }
+                // The staging buffer holds one screenful of blocks: rects that overlap, or repeat,
+                // mustn't run past its end.
+                guard stagingOffset + r.w * r.h <= staging.length else {
+                    return "BC7 rects in frame \(frameNo) cover more than the screen"
                 }
                 r.stagingOffset = stagingOffset
                 stagingOffset += r.w * r.h
@@ -153,6 +169,7 @@ final class Renderer {
             log("frame \(frameNo) hash \(String(imageHash(mirror.contents(), width: width, height: height, stride: stride), radix: 16)) (lossless parts only)")
         }
         present(rects) { presented(frameNo) }
+        return nil
     }
 
     private func decode(_ r: Rect, from src: UnsafeRawPointer) {
@@ -188,6 +205,15 @@ final class Renderer {
                 let n = compression_decode_buffer(target, size, src.assumingMemoryBound(to: UInt8.self), r.count, nil, COMPRESSION_LZ4)
                 guard n == size else { return log("bc7 lz4 decode failed (\(n) of \(size) bytes)") }
             }
+        }
+    }
+
+    /// A hash of the lossless picture as decoded so far, once everything queued has been applied.
+    /// For the tests and TANDEM_DEBUG, to check both ends hold identical pixels.
+    func losslessHash() -> UInt64 {
+        queue.sync {
+            lastCommands?.waitUntilCompleted()
+            return imageHash(mirror.contents(), width: width, height: height, stride: stride)
         }
     }
 

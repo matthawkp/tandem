@@ -132,11 +132,8 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
             window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             window.title = "Tandem (\(w)×\(h))"
         } else {
-            // The backing store size is the panel's native resolution when the Mac is at its
-            // default "looks like 2560×1440" setting, so frames map 1:1 onto physical pixels.
-            let scale = screen.backingScaleFactor
-            hello = Hello(width: Int(screen.frame.width * scale), height: Int(screen.frame.height * scale),
-                          mmWide: mm.width, mmHigh: mm.height, name: name)
+            let (w, h) = Self.panelPixels(of: screen)
+            hello = Hello(width: w, height: h, mmWide: mm.width, mmHigh: mm.height, name: name)
             frame = screen.frame
             window = FullScreenWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false, screen: screen)
             window.level = .normal
@@ -243,6 +240,15 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
         if options.windowedSize == nil { disconnectedSleep = DisconnectedSleep() }
         startListening()
         if options.windowedSize == nil { camera.start(name: name) }
+        MonitorMode.refresh { [weak self] in self?.sendSettings() }
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
+            // Once it has settled: a change comes as several notices, and so does waking.
+            self?.screenChangeWork?.cancel()
+            let work = DispatchWorkItem { self?.screenChanged() }
+            self?.screenChangeWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: work)
+        }
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             self?.willSleep()
@@ -263,6 +269,43 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
             }
         }
     }
+
+    /// The size of picture to ask for. At the default "looks like" setting the window's backing
+    /// store is the panel's own pixels, so frames map 1:1 onto them. At a "More Space" setting
+    /// the backing store is bigger than the panel (6400×3600 on a 5K iMac), and macOS scales it
+    /// down: asking for that would send half as much again only to have it thrown away, so ask
+    /// for the panel's own size instead.
+    private static func panelPixels(of screen: NSScreen) -> (Int, Int) {
+        let scale = screen.backingScaleFactor
+        let backing = (Int(screen.frame.width * scale), Int(screen.frame.height * scale))
+        guard scale >= 2, let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
+        else { return backing }
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
+        let nativeFlag: UInt32 = 0x0200_0000 // kDisplayModeNativeFlag, from IOKit's graphics types
+        guard let modes = CGDisplayCopyAllDisplayModes(id, options) as? [CGDisplayMode],
+              let native = modes.filter({ $0.ioFlags & nativeFlag != 0 }).max(by: { $0.pixelWidth < $1.pixelWidth }),
+              native.pixelWidth > 0, native.pixelHeight > 0, native.pixelWidth < backing.0, backing.1 > 0
+        else { return backing }
+        // Only the same shape: some settings leave part of the panel out (below a notch, say).
+        let shape = Double(native.pixelWidth) / Double(native.pixelHeight), backingShape = Double(backing.0) / Double(backing.1)
+        guard abs(shape - backingShape) < 0.01 * backingShape else { return backing }
+        return (native.pixelWidth, native.pixelHeight)
+    }
+
+    /// This Mac's display settings changed. The window follows its screen; and if the size of
+    /// picture to ask for is different now, Tandem starts again, as everything is built for
+    /// one size (and the other Mac's virtual display with it).
+    private func screenChanged() {
+        guard options.windowedSize == nil, let screen = window.screen ?? NSScreen.main else { return }
+        let (w, h) = Self.panelPixels(of: screen)
+        if (w, h) != (hello.width, hello.height) {
+            log("this screen is now \(w)x\(h), was \(hello.width)x\(hello.height): starting again")
+            input?.release(quietly: true)
+            return relaunch()
+        }
+        if window.frame != screen.frame, peek?.isAway != true { window.setFrame(screen.frame, display: true) }
+    }
+    private var screenChangeWork: DispatchWorkItem?
 
     func applicationDidBecomeActive(_ notification: Notification) {
         // Back from this Mac's desktop, by the Dock icon.
@@ -290,6 +333,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     // MARK: Settings
 
     private func showSettings(from button: NSView) {
+        MonitorMode.refresh { [weak self] in self?.sendSettings() }
         settingsMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 6), in: button)
     }
 
@@ -365,7 +409,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleAutoRestart() {
-        MonitorMode.setRestartsAfterPowerFailure(!MonitorMode.restartsAfterPowerFailure)
+        MonitorMode.setRestartsAfterPowerFailure(!MonitorMode.restartsAfterPowerFailure) { [weak self] in self?.sendSettings() }
     }
 
     private func met(_ peer: Peer) {
@@ -484,9 +528,13 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
             hello.brightness = BuiltInBrightness.get() ?? -1
         }
         channel.onReady = { [weak channel, hello] in channel?.send(.hello, hello.encoded()) }
+        // Whether this connection's picture is showing, as far as its messages say, in the order
+        // they came: on the network queue only. `streaming` itself belongs to the main thread.
+        var showing = false
         channel.onMessage = { [weak self, weak channel] kind, body in
             guard let self else { return }
             if kind == .status {
+                showing = false
                 let text = String(decoding: body, as: UTF8.self)
                 log("status from sender: \(text)")
                 DispatchQueue.main.async { self.senderStatus(text) }
@@ -494,6 +542,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
             }
             if kind == .power {
                 guard let power = body.first.flatMap(Wire.Power.init) else { return }
+                if power == .sleep { showing = false }
                 DispatchQueue.main.async { self.macPower(power) }
                 return
             }
@@ -512,7 +561,11 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
                 return
             }
             if kind == .settings {
-                DispatchQueue.main.async { self.sendSettings() }
+                DispatchQueue.main.async {
+                    self.sendSettings()
+                    // And again if a setting kept by macOS turns out to have changed.
+                    MonitorMode.refresh { [weak self] in self?.sendSettings() }
+                }
                 return
             }
             if kind == .settingsChoice {
@@ -574,13 +627,22 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
                 return
             }
             guard kind == .frame else { return }
-            if !self.streaming { DispatchQueue.main.async { self.startedStreaming() } }
-            self.streaming = true
-            self.renderer.apply(body) { frameNo in
+            if !showing {
+                showing = true
+                DispatchQueue.main.async {
+                    guard self.channel === channel else { return }
+                    self.streaming = true
+                    self.startedStreaming()
+                }
+            }
+            self.renderer.apply(body, presented: { frameNo in
                 var ack = Data()
                 ack.appendLE(frameNo)
                 channel?.send(.ack, ack)
-            }
+            }, rejected: {
+                // The sender starts again with a whole frame, rather than wait for an answer.
+                channel?.cancel()
+            })
         }
         channel.onClose = { [weak self, weak channel] _ in
             DispatchQueue.main.async {

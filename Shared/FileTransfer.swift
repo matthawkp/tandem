@@ -69,11 +69,14 @@ final class FileSender {
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("Tandem-\(UUID().uuidString)")
         let copy = work.appendingPathComponent(url.lastPathComponent)
         let zip = work.appendingPathComponent("item.zip")
+        // Always on the files queue, which owns the list: a send that fails reports on the network's.
         let finish = { (sent: Bool) in
-            try? FileManager.default.removeItem(at: work)
-            DispatchQueue.main.async { self.onSent(url.lastPathComponent, sent) }
-            self.busy = false
-            self.next()
+            self.queue.async {
+                try? FileManager.default.removeItem(at: work)
+                DispatchQueue.main.async { self.onSent(url.lastPathComponent, sent) }
+                self.busy = false
+                self.next()
+            }
         }
         // Copied first by this app, which the drop lets read the item; ditto then works on the copy.
         // On the same APFS volume the copy is a clone, so it's instant whatever the size.

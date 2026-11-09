@@ -68,6 +68,20 @@ final class SenderController: @unchecked Sendable {
         onFrame: { [weak self] buffer in self?.frameArrived(buffer) },
         onStop: { [weak self] error in DispatchQueue.main.async { self?.captureStopped(error) } })
     private var restartWork: DispatchWorkItem?
+    /// Draws the pointer on the receiver, when it can.
+    private var cursorTracker: CursorTracker?
+    private var receiverDrawsCursor = false
+    /// Between this Mac going to sleep and waking. It still runs now and then while asleep (to
+    /// check mail, say), and would otherwise find the display Mac, connect, test the link and
+    /// lose it again, every minute for as long as it sleeps.
+    private var asleep = false
+    /// The connection was made before this Mac slept, so the other end has probably gone.
+    private var connectedBeforeSleep = false
+    /// The receiver has said hello on this connection, whether or not a picture followed.
+    private var heardHello = false
+    /// The last link test, which holds for a while: reconnecting doesn't send it all again.
+    private var lastLink: (rate: Double, name: String, peer: String, at: Date)?
+    private let linkTestLifetime: TimeInterval = 600
     private var wakePending = false
     private var askedForScreenRecording = false
     /// The iMac said it was going to sleep, so its disappearance isn't a pulled cable.
@@ -86,6 +100,7 @@ final class SenderController: @unchecked Sendable {
     private var sentInputState: Wire.InputState?
     /// Link test, on netQueue: when the first reply came, and how many are still to come.
     private var probe: (first: DispatchTime?, remaining: Int)?
+    private let probeCount = 24
     private lazy var probeChunk: Data = {
         var d = Data(count: 4 << 20)
         d.withUnsafeMutableBytes { arc4random_buf($0.baseAddress, $0.count) }
@@ -104,9 +119,9 @@ final class SenderController: @unchecked Sendable {
     /// much the receiver keeps up with (TileEncoder.observePipeline).
     private var unacked: [UInt32: Int] = [:]
     private var lastAck: Double?
-    /// Draws the pointer on the receiver, when it can.
-    private var cursorTracker: CursorTracker?
-    private var receiverDrawsCursor = false
+    /// When the last frame went, to notice a receiver that has stopped acknowledging them.
+    private var lastFrameSent: Double?
+    private let ackTimeout = 10.0
     private var synthetic: SyntheticSource?
     private var syntheticTimer: DispatchSourceTimer?
     private var counted = (frames: 0, raw: 0, sent: 0, bc7: 0)
@@ -176,6 +191,8 @@ final class SenderController: @unchecked Sendable {
         paused = true
         setStatus("Paused")
         guard let channel else { return }
+        // No more frames: one after the reason would bring the picture back over it.
+        setSending(false)
         // Let the iMac show why it went dark before hanging up.
         var cancelled = false
         let hangUp = { if !cancelled { cancelled = true; channel.cancel() } }
@@ -187,6 +204,13 @@ final class SenderController: @unchecked Sendable {
         paused = false
         setStatus(options.host == nil ? "Looking for your \(peerKind)…" : "Connecting…")
         connect()
+    }
+
+    /// Stops frames going out, or lets them go again. Stopping waits for a frame being encoded,
+    /// so whatever is sent next (why the picture is going, say) comes after the last frame.
+    private func setSending(_ on: Bool) {
+        let channel = on && hello != nil ? self.channel : nil
+        encodeQueue.sync { sendChannel = channel }
     }
 
     /// Tells the iMac why there's no picture; it shows this on its splash screen.
@@ -225,8 +249,6 @@ final class SenderController: @unchecked Sendable {
         sendDisplay(DisplayState(brightness: value, colorMatrix: sentDisplay?.colorMatrix ?? DisplayState.identity))
     }
 
-    /// A brightness key pressed while the pointer is on the iMac: one of macOS's 16 steps, or a
-    /// quarter step with Option-Shift, like the built-in display.
     /// A brightness key from the iMac's keyboard: the iMac's if the pointer is on it, as for the
     /// MacBook's keys; otherwise false, and it goes to the MacBook.
     private func receiverKeyboardBrightness(_ direction: Float, fine: Bool) -> Bool {
@@ -237,6 +259,8 @@ final class SenderController: @unchecked Sendable {
         return true
     }
 
+    /// A brightness key pressed while the pointer is on the iMac: one of macOS's 16 steps, or a
+    /// quarter step with Option-Shift, like the built-in display.
     func stepReceiverBrightness(_ direction: Float, fine: Bool) {
         guard let current = receiverBrightness, let screen else { return }
         let step: Float = fine ? 1 / 64 : 1 / 16
@@ -262,7 +286,7 @@ final class SenderController: @unchecked Sendable {
     }
 
     private func connect() {
-        guard channel == nil, !paused else { return }
+        guard channel == nil, !paused, !asleep else { return }
         let params = Wire.tcpParameters(allowWiFi: options.allowWiFi)
         let connection: NWConnection
         if let host = options.host {
@@ -350,12 +374,16 @@ final class SenderController: @unchecked Sendable {
             }
         }
         self.channel = channel
+        heardHello = false
+        connectedBeforeSleep = false
         log("connecting to \(connection.endpoint) via \(params.requiredInterface?.name ?? "any interface")")
         channel.start()
 
         // A connection with no usable path waits forever; give up and try again.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self, weak channel] in
-            guard let self, let channel, self.channel === channel, self.hello == nil else { return }
+            // Not once it has answered, even with a version this one can't use: hanging up then
+            // would only connect again to hear the same, every few seconds.
+            guard let self, let channel, self.channel === channel, !self.heardHello else { return }
             log("no answer from \(connection.endpoint), retrying")
             channel.cancel()
         }
@@ -428,6 +456,7 @@ final class SenderController: @unchecked Sendable {
 
     private func receiverSaidHello(_ hello: Hello, on channel: MessageChannel) {
         guard self.channel === channel else { return }
+        heardHello = true
         guard hello.version == Wire.version else {
             log("receiver speaks version \(hello.version), we speak \(Wire.version)")
             setStatus("Update Tandem on your \(hello.kind)")
@@ -460,7 +489,14 @@ final class SenderController: @unchecked Sendable {
             wakePending = false
             channel.send(.power, Data([Wire.Power.wake.rawValue]))
         }
-        measureLink(on: channel)
+        var knownRate: Double?
+        if let last = lastLink, last.peer == hello.name, Date().timeIntervalSince(last.at) < linkTestLifetime {
+            knownRate = last.rate
+            linkName = last.name
+            linkRate = last.rate
+        } else {
+            measureLink(on: channel)
+        }
 
         if !options.synthetic {
             // Without permission the display would stay blank, and new windows (including the
@@ -482,6 +518,7 @@ final class SenderController: @unchecked Sendable {
             } else {
                 self.screen = nil
                 guard let screen = VirtualScreen(hello: hello) else {
+                    log("couldn't create the virtual display for \(hello.name)")
                     setStatus("Couldn't create the virtual display")
                     return
                 }
@@ -495,12 +532,14 @@ final class SenderController: @unchecked Sendable {
         encodeQueue.sync {
             encoder = TileEncoder(width: hello.width, height: hello.height, bc7: hello.capabilities.contains(.bc7))
             encoder?.quality = quality
+            if let knownRate { encoder?.linkBytesPerSecond = knownRate }
             sendChannel = channel
             latest = nil
             lastBuffer = nil
             inFlight = 0
             unacked = [:]
             lastAck = nil
+            lastFrameSent = nil
         }
         startDisplaySync()
         startCursor(hello, on: channel)
@@ -523,6 +562,7 @@ final class SenderController: @unchecked Sendable {
         cursorTracker = nil
         channel = nil
         hello = nil
+        heardHello = false
         netQueue.async {
             self.probe = nil
             self.inputPlayer.releaseAll()
@@ -551,6 +591,7 @@ final class SenderController: @unchecked Sendable {
             inFlight = 0
             unacked = [:]
             lastAck = nil
+            lastFrameSent = nil
         }
         if paused { return setStatus(status) }
         if receiverAsleep {
@@ -565,7 +606,7 @@ final class SenderController: @unchecked Sendable {
 
     /// Sends a burst of filler and times the replies, to know how much can go lossless.
     private func measureLink(on channel: MessageChannel) {
-        let count = 24
+        let count = probeCount
         let chunk = probeChunk
         netQueue.async {
             self.probe = (nil, count)
@@ -582,7 +623,8 @@ final class SenderController: @unchecked Sendable {
         guard probe.remaining == 0, let first = probe.first else { return }
         self.probe = nil
         let seconds = Double(DispatchTime.now().uptimeNanoseconds - first.uptimeNanoseconds) / 1e9
-        let bytes = 23 * (4 << 20)
+        // The first reply starts the clock, so it's the rest that were timed.
+        let bytes = (probeCount - 1) * probeChunk.count
         var rate = Double(bytes) / max(seconds, 0.001)
         // TANDEM_LINK_GBIT: pretend the link is this fast, for testing.
         if let forced = ProcessInfo.processInfo.environment["TANDEM_LINK_GBIT"].flatMap(Double.init) { rate = forced * 1e9 / 8 }
@@ -603,6 +645,7 @@ final class SenderController: @unchecked Sendable {
         } ?? "Network"
         linkName = name
         linkRate = rate
+        if let peer = hello?.name { lastLink = (rate, name, peer, Date()) }
         onChange?()
     }
 
@@ -680,7 +723,13 @@ final class SenderController: @unchecked Sendable {
         screensOff = true
         // Keep the virtual display through sleep, so windows are still on it afterwards.
         if system && screen != nil { holdScreen = true }
+        if system {
+            asleep = true
+            connectedBeforeSleep = channel != nil
+        }
         guard prefs.sleepsReceiver, let channel, hello != nil else { return }
+        // No more frames: one after this would bring the picture back on the display Mac.
+        setSending(false)
         let sent = DispatchSemaphore(value: 0)
         channel.send(.power, Data([Wire.Power.sleep.rawValue])) { sent.signal() }
         // macOS sleeps as soon as observers return, so get the message out first.
@@ -691,12 +740,20 @@ final class SenderController: @unchecked Sendable {
         log(system ? "woke" : "screens turned on")
         if screensOff && (!system || CGDisplayIsAsleep(CGMainDisplayID()) == 0) {
             screensOff = false
+            setSending(true)
             startCapture()
+        }
+        if !system, asleep {
+            // The screens are on, so it's awake, whichever of the two notices comes first.
+            asleep = false
+            connect()
         }
         if system {
             // The iMac hung up while we slept, but our heartbeat can't tell: its clock stops
             // during sleep. Start a fresh connection straight away.
-            channel?.cancel()
+            // Not one made since waking, when the screens came on first.
+            asleep = false
+            if channel == nil { connect() } else if connectedBeforeSleep { channel?.cancel() }
             // If the iMac doesn't come back, stop holding on to its display.
             dropScreenWork?.cancel()
             let work = DispatchWorkItem { [weak self] in
@@ -747,20 +804,24 @@ final class SenderController: @unchecked Sendable {
         }
         needsPermission = false
         let displayID = screen.displayID
+        let showsCursor = !receiverDrawsCursor
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.capture.start(displayID: displayID, width: hello.width, height: hello.height,
-                                             showsCursor: !self.receiverDrawsCursor)
+                // False when a later start took over while this one was starting; that one reports.
+                guard try await self.capture.start(displayID: displayID, width: hello.width, height: hello.height,
+                                                   showsCursor: showsCursor) else { return }
                 self.encodeQueue.async { self.encoder?.invalidate() }
                 DispatchQueue.main.async {
+                    // The link or the display may have gone while capture was starting.
+                    guard self.hello != nil, self.screen?.displayID == displayID else { return }
                     self.isStreaming = true
                     self.setStatus("Connected")
                 }
             } catch {
                 log("capture failed: \(error)")
                 DispatchQueue.main.async {
-                    guard !self.screensOff else { return }
+                    guard !self.screensOff, self.hello != nil, self.screen?.displayID == displayID else { return }
                     self.setStatus("Couldn't capture the display")
                     self.tellReceiver("Your \(Machine.kind) couldn't capture the display: \(error.localizedDescription)")
                 }
@@ -835,6 +896,8 @@ final class SenderController: @unchecked Sendable {
               let base = CVPixelBufferGetBaseAddress(buffer)
         else {
             log("unexpected frame size \(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer))")
+            // Not kept for refreshing from, which would only say this again, many times a second.
+            if lastBuffer === buffer { lastBuffer = nil }
             return
         }
         let frame = TileEncoder.Frame(base: base, stride: CVPixelBufferGetBytesPerRow(buffer), source: .pixelBuffer(buffer))
@@ -850,6 +913,7 @@ final class SenderController: @unchecked Sendable {
         counted.raw += stats.rawBytes
         counted.sent += body.count
         counted.bc7 += stats.bc7Raw
+        lastFrameSent = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
         channel.send(.frame, body)
     }
 
@@ -865,12 +929,25 @@ final class SenderController: @unchecked Sendable {
         encoder.observePipeline(bytes: bytes, seconds: now - lastAck)
     }
 
+    /// Frames wait for the receiver to acknowledge the ones before. If it stops, while its pings
+    /// keep the link alive, the picture would stand still for good: start again instead.
+    private func checkAcks() {
+        guard inFlight > 0, let sent = lastFrameSent, let sendChannel else { return }
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1e9
+        guard now - max(sent, lastAck ?? 0) > ackTimeout else { return }
+        log("no frame acknowledged for \(Int(ackTimeout)) s, reconnecting")
+        lastFrameSent = nil
+        sendChannel.cancel()
+    }
+
     /// Makes lossy tiles sharp again once the screen stops changing.
     private func startSettleTimer() {
         let timer = DispatchSource.makeTimerSource(queue: encodeQueue)
         timer.schedule(deadline: .now() + 0.1, repeating: 0.05)
         timer.setEventHandler { [weak self] in
-            guard let self, self.encoder?.needsRefresh == true, self.latest == nil, self.synthetic == nil else { return }
+            guard let self else { return }
+            self.checkAcks()
+            guard self.encoder?.needsRefresh == true, self.latest == nil, self.synthetic == nil else { return }
             self.pump()
         }
         timer.resume()

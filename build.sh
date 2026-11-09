@@ -9,7 +9,6 @@ set -euo pipefail
 cd "${0:A:h}"
 
 OUT=build
-VERSION=1.0
 BUILD=$(date +%Y%m%d%H%M)
 TEAM=${TANDEM_TEAM:-$(cat Support/team 2>/dev/null || true)}
 [[ -n $TEAM ]] || { echo "Put your Apple Developer team ID in Support/team"; exit 1; }
@@ -20,6 +19,6 @@ rm -rf $OUT && mkdir -p $OUT
 TANDEM_TEAM=$TEAM TANDEM_BUNDLE_ID=$BUNDLE xcodegen generate --quiet
 xcodebuild -project Tandem.xcodeproj -scheme Tandem -configuration Release -derivedDataPath .xcode \
   -allowProvisioningUpdates -allowProvisioningDeviceRegistration -destination "generic/platform=macOS" -quiet \
-  CURRENT_PROJECT_VERSION=$BUILD MARKETING_VERSION=$VERSION build
+  CURRENT_PROJECT_VERSION=$BUILD build
 cp -R .xcode/Build/Products/Release/Tandem.app $OUT/
 echo "Done: $OUT/Tandem.app"

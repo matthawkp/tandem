@@ -79,7 +79,13 @@ brightness and CoreBrightness for True Tone.
 
 Tandem only talks over the Thunderbolt Bridge, the cable between the two Macs: connections from
 any other network, or from other apps on the same Mac, are refused. The link itself isn't
-encrypted or authenticated, so anything plugged into the other end of the cable is trusted.
+encrypted or authenticated, so anything plugged into the other end of the cable is trusted,
+though what it sends is checked before it's used.
+
+Tandem Camera's pictures go from Tandem to its camera extension over a port only this Mac can
+reach. Apps run by the person using the Mac are turned away from it (`Sender/LocalPeer.swift`);
+processes of other users on the same Mac can't be told apart from the extension, which macOS
+runs as a user of its own.
 
 ## Building from source
 
@@ -114,7 +120,18 @@ hashes. More switches for the extending side:
 - `TANDEM_CHECK_DIFF=1` / `TANDEM_CPU_DIFF=1`: check, or replace, the GPU tile comparison on the
   CPU.
 
-Logs are in `~/Library/Logs/Tandem.log`.
+Logs are in `~/Library/Logs/Tandem.log`, with the run before in `Tandem.previous.log`.
+
+### Tests
+
+```sh
+xcodebuild test -project Tandem.xcodeproj -scheme TandemTests -destination platform=macOS
+```
+
+`Tests/` covers what needs no second Mac: the messages that cross the cable, and a picture going
+through the encoder and out of the renderer pixel for pixel. They're signed to run locally, so
+they need no developer account (generate the project first: `xcodegen generate`, with
+`TANDEM_TEAM` and `TANDEM_BUNDLE_ID` set as `build.sh` does).
 
 ## Licence
 

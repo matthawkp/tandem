@@ -1,6 +1,17 @@
 import AppKit
 import ApplicationServices
 
+/// Accessibility permission, which event taps that can change events, and posting events, need.
+enum Accessibility {
+    static var isAllowed: Bool { AXIsProcessTrusted() }
+
+    /// Shows macOS's own prompt, which leads to Privacy & Security → Accessibility.
+    static func prompt() {
+        let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
+    }
+}
+
 /// A session event tap on the main run loop: it sees this Mac's keyboard and mouse events before
 /// any app, and can change or drop them. Needs Accessibility.
 ///

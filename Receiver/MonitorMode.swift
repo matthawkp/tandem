@@ -3,8 +3,24 @@ import IOKit.pwr_mgt
 
 /// Settings that make this Mac behave like a monitor: on at power-up, straight into Tandem.
 enum MonitorMode {
-    /// Whether this Mac starts by itself when power returns after a cut.
-    static var restartsAfterPowerFailure: Bool {
+    /// Whether this Mac starts by itself when power returns after a cut, as last found out:
+    /// asking pmset takes a moment, so it's done in the background (`refresh`) and remembered.
+    /// On the main thread.
+    private(set) static var restartsAfterPowerFailure = false
+
+    /// Finds out again, and calls `changed` on the main thread if it's different now.
+    static func refresh(changed: @escaping () -> Void = {}) {
+        DispatchQueue.global(qos: .utility).async {
+            let now = readRestartsAfterPowerFailure()
+            DispatchQueue.main.async {
+                guard now != restartsAfterPowerFailure else { return }
+                restartsAfterPowerFailure = now
+                changed()
+            }
+        }
+    }
+
+    private static func readRestartsAfterPowerFailure() -> Bool {
         let pmset = Process()
         pmset.executableURL = URL(fileURLWithPath: "/usr/bin/pmset")
         pmset.arguments = ["-g"]
@@ -19,12 +35,15 @@ enum MonitorMode {
         }
     }
 
-    /// Needs an administrator, so macOS asks for a password.
-    static func setRestartsAfterPowerFailure(_ on: Bool) {
+    /// Needs an administrator, so macOS asks for a password, on this Mac, for as long as it takes
+    /// someone to type it. Not on the main thread, then: the picture's pointer and this Mac's
+    /// keyboard and mouse carry on meanwhile. `changed` is called on the main thread if it took.
+    static func setRestartsAfterPowerFailure(_ on: Bool, changed: @escaping () -> Void = {}) {
         let source = "do shell script \"/usr/bin/pmset -a autorestart \(on ? 1 : 0)\" with administrator privileges"
-        var error: NSDictionary?
-        NSAppleScript(source: source)?.executeAndReturnError(&error)
-        if let error { log("couldn't change autorestart: \(error)") }
+        DispatchQueue.global(qos: .userInitiated).async {
+            if ScreenProbe.osascript(source) == nil { log("couldn't change autorestart") }
+            refresh(changed: changed)
+        }
     }
 
     /// Automatic login is set in Users & Groups, and needs FileVault off.

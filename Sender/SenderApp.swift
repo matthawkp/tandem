@@ -117,7 +117,7 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if controller.needsPermission {
             menu.addItem(item("Allow Screen Recording…", #selector(openPermissions)))
         }
-        if wantsAccessibility && !BrightnessKeys.isAllowed {
+        if wantsAccessibility && !Accessibility.isAllowed {
             let allow = item("Allow Accessibility…", #selector(allowAccessibility))
             allow.toolTip = "Lets the \(peer)'s keyboard and mouse control this Mac, and the brightness keys reach the \(peer)."
             menu.addItem(allow)
@@ -449,16 +449,16 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func allowAccessibility() {
-        BrightnessKeys.requestPermission()
+        Accessibility.prompt()
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
     private func setUpBrightnessKeys() {
         let prefs = controller.prefs
         let wantsAccessibility = prefs.brightnessKeysFollowPointer || prefs.usesReceiverInput
-        if wantsAccessibility && !BrightnessKeys.isAllowed && !prefs.askedForAccessibility {
+        if wantsAccessibility && !Accessibility.isAllowed && !prefs.askedForAccessibility {
             prefs.askedForAccessibility = true
-            BrightnessKeys.requestPermission()
+            Accessibility.prompt()
         }
         brightnessKeys.setEnabled(prefs.brightnessKeysFollowPointer)
     }

@@ -337,7 +337,7 @@ final class PeekSession {
         let drives = AXIsProcessTrusted()
         if !drives {
             log("peek: the other Mac's keyboard and trackpad need Accessibility here")
-            InputCapture.requestAccessibility()
+            Accessibility.prompt()
         }
         phase = .spreading(macDrives: drives, resumes: resumes)
         portal.spread { [weak self] in

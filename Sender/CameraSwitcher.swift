@@ -136,6 +136,13 @@ final class CameraSwitcher: NSObject, AVCaptureVideoDataOutputSampleBufferDelega
     // MARK: Viewers
 
     private func accept(_ connection: NWConnection) {
+        // Only Tandem's own camera extension. Any app on this Mac can reach this port, and one
+        // that did would get the cameras' pictures without being allowed the camera itself.
+        guard case .hostPort(_, let port) = connection.endpoint else { return connection.cancel() }
+        if let pid = LocalPeer.process(connectedFrom: port.rawValue, to: Wire.switcherPort) {
+            log("camera switcher: refused \(LocalPeer.path(of: pid)), which isn't Tandem Camera")
+            return connection.cancel()
+        }
         let channel = MessageChannel(connection, queue: queue)
         let id = ObjectIdentifier(channel)
         channel.onClose = { [weak self] _ in

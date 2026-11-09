@@ -9,7 +9,6 @@ set -euo pipefail
 cd "${0:A:h}"
 
 PROFILE=tandem
-VERSION=1.2.4
 BUILD=$(date +%Y%m%d%H%M)
 TEAM=${TANDEM_TEAM:-$(cat Support/team 2>/dev/null || true)}
 [[ -n $TEAM ]] || { echo "Put your Apple Developer team ID in Support/team"; exit 1; }
@@ -35,7 +34,7 @@ echo "Archiving…"
 TANDEM_TEAM=$TEAM TANDEM_BUNDLE_ID=$BUNDLE xcodegen generate --quiet
 xcodebuild -project Tandem.xcodeproj -scheme Tandem -configuration Release -derivedDataPath .xcode \
   -archivePath $OUT/Tandem.xcarchive -destination "generic/platform=macOS" -allowProvisioningUpdates -quiet \
-  CURRENT_PROJECT_VERSION=$BUILD MARKETING_VERSION=$VERSION archive
+  CURRENT_PROJECT_VERSION=$BUILD archive
 
 echo "Signing with Developer ID…"
 cat > $OUT/export.plist <<EOF

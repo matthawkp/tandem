@@ -81,6 +81,12 @@ enum Wire {
     /// Bumped whenever the two apps stop understanding each other.
     static let version: UInt16 = 4
 
+    /// No message is ever this long (a whole 6K frame, uncompressed, is under 100 MB): a longer
+    /// one is a mistake or mischief, and the connection is dropped rather than its length believed.
+    static let maxMessageLength = 512 << 20
+    /// No panel is wider or taller than this, in pixels. Rects carry their place in 16 bits.
+    static let maxDimension = 16384
+
     struct Capabilities: OptionSet {
         let rawValue: UInt16
         static let bc7 = Capabilities(rawValue: 1)
@@ -216,6 +222,7 @@ struct Hello {
         guard d.count >= 32 else { return nil }
         width = Int(d.readLE(UInt32.self, at: 0))
         height = Int(d.readLE(UInt32.self, at: 4))
+        guard (1...Wire.maxDimension).contains(width), (1...Wire.maxDimension).contains(height) else { return nil }
         mmWide = Double(bitPattern: d.readLE(UInt64.self, at: 8))
         mmHigh = Double(bitPattern: d.readLE(UInt64.self, at: 16))
         version = d.readLE(UInt16.self, at: 24)
@@ -366,6 +373,12 @@ struct InputEvent {
     }
 
     subscript(field: UInt32) -> Double { fields[field] ?? 0 }
+
+    /// A field as a whole number, or nil if it isn't one that fits: what the other Mac sends is
+    /// never trusted to convert (a NaN or a huge value would otherwise stop the app).
+    func integer<T: FixedWidthInteger>(_ field: UInt32, as _: T.Type = T.self) -> T? {
+        T(exactly: self[field].rounded(.towardZero))
+    }
 }
 
 extension Data {
@@ -485,6 +498,10 @@ final class MessageChannel {
             self.lastHeard = .now()
             let length = Int(data.readLE(UInt32.self, at: 0))
             let kind = Wire.Kind(rawValue: data[data.startIndex + 4])
+            guard length <= Wire.maxMessageLength else {
+                log("message of \(length) bytes is too long, closing")
+                return self.close(NWError.posix(.EMSGSIZE))
+            }
             if length == 0 {
                 if let kind { self.onMessage?(kind, Data()) }
                 return done ? self.close(nil) : self.readHeader()
@@ -519,12 +536,41 @@ func imageHash(_ base: UnsafeRawPointer, width: Int, height: Int, stride: Int) -
 
 let debugEnabled = ProcessInfo.processInfo.environment["TANDEM_DEBUG"] != nil
 
-private let logHandle: FileHandle? = {
-    let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs")
-    let url = dir.appendingPathComponent("\(ProcessInfo.processInfo.processName).log")
-    FileManager.default.createFile(atPath: url.path, contents: nil)
-    return try? FileHandle(forWritingTo: url)
-}()
+/// The log file, ~/Library/Logs/<process>.log. The last run's is kept beside it as
+/// "<process>.previous.log", so what led up to a crash or a restart can still be read; and a run
+/// that goes on for weeks starts a fresh file once this one is large. Used on `logQueue`.
+private enum LogFile {
+    private static let limit = 4 << 20
+    private static let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/\(ProcessInfo.processInfo.processName).log")
+    private static var handle: FileHandle? = open()
+    private static var written = 0
+
+    /// Moves the file aside, if there's one, and starts a new one.
+    private static func open() -> FileHandle? {
+        // Not from the unit tests, which would leave an "xctest.log".
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return nil }
+        let files = FileManager.default
+        let previous = url.deletingPathExtension().appendingPathExtension("previous.log")
+        try? files.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if files.fileExists(atPath: url.path) {
+            try? files.removeItem(at: previous)
+            try? files.moveItem(at: url, to: previous)
+        }
+        files.createFile(atPath: url.path, contents: nil)
+        return try? FileHandle(forWritingTo: url)
+    }
+
+    static func write(_ line: Data) {
+        if written > limit {
+            try? handle?.close()
+            handle = open()
+            written = 0
+        }
+        handle?.write(line)
+        written += line.count
+    }
+}
 
 private let logQueue = DispatchQueue(label: "log")
 
@@ -542,6 +588,6 @@ func log(_ message: String) {
     let line = "\(logTime.string(from: Date())) \(message)\n"
     logQueue.async {
         FileHandle.standardError.write(Data(line.utf8))
-        logHandle?.write(Data(line.utf8))
+        LogFile.write(Data(line.utf8))
     }
 }

@@ -15,7 +15,8 @@ settings:
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.0"
     ENABLE_HARDENED_RUNTIME: YES
-    MARKETING_VERSION: "1.2.4"
+    # The one place the version is set; build.sh and release.sh only add the build number.
+    MARKETING_VERSION: "1.2.5"
     CURRENT_PROJECT_VERSION: "1"
     ARCHS: "arm64 x86_64"
     ONLY_ACTIVE_ARCH: NO
@@ -57,3 +58,31 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Support/Camera.entitlements
         SKIP_INSTALL: YES
         MACOSX_DEPLOYMENT_TARGET: "12.3"
+  # Unit tests for the parts that need no second Mac: the wire format, and a frame going through
+  # the encoder and the renderer. Run with: xcodebuild test -project Tandem.xcodeproj -scheme TandemTests
+  TandemTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests
+      - Shared/Wire.swift
+      - Shared/Machine.swift
+      - Shared/RemoteMenu.swift
+      - Shared/CameraLink.swift
+      - Sender/TileEncoder.swift
+      - Sender/BC7Encoder.swift
+      - Sender/TileDiffer.swift
+      - Sender/VirtualScreen.swift
+      - Receiver/Renderer.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ${TANDEM_BUNDLE_ID}.Tests
+        GENERATE_INFOPLIST_FILE: YES
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sender/CGVirtualDisplay.h
+        # Signed to run on this Mac only: tests need no developer account.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "-"
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: NO
+        ONLY_ACTIVE_ARCH: YES
