@@ -1,0 +1,6 @@
+#!/bin/sh
+. /usr/lib/tandem/functions
+say "shutting down"
+/usr/lib/tandem/save-logs
+umount $MEDIA 2>/dev/null
+sync

@@ -10,6 +10,10 @@ either part.
 
 **[Download the latest release](../../releases/latest)**: signed and notarised, free.
 
+**An iMac with a dead drive?** [Tandem Display for iMac](Stick/) is a USB flash drive that makes
+a 27-inch 5K iMac a Tandem display without macOS: [download it](https://github.com/matthawkp/tandem/releases/tag/stick-1.0)
+and copy it onto any flash drive.
+
 ## What it does
 
 Described for the common case, a MacBook extending onto an iMac.

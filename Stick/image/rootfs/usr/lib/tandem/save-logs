@@ -1,0 +1,23 @@
+#!/bin/sh
+# Copies this boot's logs to the stick, so they can be read on another machine: the stick is
+# only writable for the moment this takes.
+. /usr/lib/tandem/functions
+[ -f $RUN/media ] || exit 0
+mkdir $RUN/saving 2>/dev/null || exit 0
+trap 'rmdir $RUN/saving' EXIT
+
+mount -o remount,rw $MEDIA 2>/dev/null || exit 0
+number=$(cat $RUN/boot-number)
+logs=$MEDIA/tandem-logs
+folder=$logs/boot-$number
+mkdir -p $folder
+echo "$number" > $logs/count
+dmesg > $folder/kernel.txt 2>/dev/null
+cp $RUN/boot.log $folder/boot.txt 2>/dev/null
+cp $RUN/display.log $folder/display.txt 2>/dev/null
+/usr/lib/tandem/report > $folder/system.txt 2>&1
+# The last eight boots are plenty.
+old=$((number - 8))
+[ $old -gt 0 ] && rm -rf $logs/boot-$old
+sync
+mount -o remount,ro $MEDIA 2>/dev/null

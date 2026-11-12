@@ -1,0 +1,29 @@
+# Shared by the scripts in /usr/lib/tandem.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+RUN=/run/tandem
+MEDIA=/boot-media
+
+# Started "quiet" (the boot menu's 5K and 4K entries): nothing on the screen, where it would
+# replace the starting picture. Everything still goes to the logs.
+QUIET=
+grep -qw quiet /proc/cmdline 2>/dev/null && QUIET=yes
+
+say() {
+    [ -n "$QUIET" ] || echo "tandem: $*"
+    echo "$(cut -d' ' -f1 /proc/uptime) $*" >> $RUN/boot.log
+}
+
+# conf KEY DEFAULT: a setting from tandem.conf on the stick. The file is only ever read as
+# text, never run.
+conf() {
+    value=$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" $RUN/tandem.conf 2>/dev/null | tail -n 1 | sed 's/[[:space:]]*$//')
+    echo "${value:-$2}"
+}
+
+# on_cmdline WORD: whether the boot menu entry passed it.
+on_cmdline() {
+    for word in $(cat /proc/cmdline); do
+        [ "$word" = "$1" ] && return 0
+    done
+    return 1
+}
