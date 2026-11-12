@@ -1,0 +1,69 @@
+#!/bin/sh
+# What this machine is and what state it's in, for the logs.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+section() { echo; echo "== $*"; }
+
+section "System"
+echo "Tandem Display $(cat /usr/share/tandem/version)"
+uname -a
+echo "model: $(cat /sys/class/dmi/id/product_name 2>/dev/null), board $(cat /sys/class/dmi/id/board_name 2>/dev/null), firmware $(cat /sys/class/dmi/id/bios_version 2>/dev/null)"
+echo "command line: $(cat /proc/cmdline)"
+echo "up $(cut -d' ' -f1 /proc/uptime) s"
+grep -m1 'model name' /proc/cpuinfo
+grep -E 'MemTotal|MemAvailable' /proc/meminfo
+
+section "Settings (tandem.conf)"
+grep -v '^[[:space:]]*#' /run/tandem/tandem.conf 2>/dev/null | grep -v '^[[:space:]]*$'
+
+section "PCI devices (vendor:device class driver)"
+for device in /sys/bus/pci/devices/*; do
+    driver=$(basename "$(readlink $device/driver 2>/dev/null)" 2>/dev/null)
+    echo "${device##*/} $(cat $device/vendor):$(cat $device/device) $(cat $device/class) ${driver:--}"
+done
+
+section "Screens"
+for connector in /sys/class/drm/card*-*; do
+    [ -e "$connector/status" ] || continue
+    echo "${connector##*/}: $(cat $connector/status), enabled $(cat $connector/enabled 2>/dev/null), modes: $(tr '\n' ' ' < $connector/modes | cut -c1-200)"
+done
+for state in /sys/kernel/debug/dri/*/state; do
+    [ -r "$state" ] && { echo "-- $state"; grep -E '^(plane|crtc|connector)|crtc-pos|src-pos|active=|mode:|fb=|size=' $state | head -n 80; }
+done
+
+section "Backlight"
+for light in /sys/class/backlight/*; do
+    [ -e "$light" ] && echo "${light##*/}: $(cat $light/brightness) of $(cat $light/max_brightness), type $(cat $light/type)"
+done
+
+section "Thunderbolt"
+for device in /sys/bus/thunderbolt/devices/*; do
+    [ -e "$device" ] || continue
+    echo "${device##*/}: $(cat $device/vendor_name 2>/dev/null) $(cat $device/device_name 2>/dev/null) $(cat $device/unique_id 2>/dev/null)"
+done
+
+section "Network"
+ip addr 2>&1
+for interface in /sys/class/net/thunderbolt*; do
+    [ -e "$interface" ] && echo "${interface##*/}: carrier $(cat $interface/carrier 2>/dev/null), speed $(cat $interface/speed 2>/dev/null), mtu $(cat $interface/mtu)"
+done
+
+section "Input devices"
+grep -E '^N: Name|^H: Handlers' /proc/bus/input/devices
+
+section "Fans and temperatures"
+for monitor in /sys/class/hwmon/hwmon*; do
+    echo "${monitor##*/}: $(cat $monitor/name 2>/dev/null)"
+    for fan in $monitor/fan*_input $monitor/device/fan*_input; do
+        [ -e "$fan" ] && echo "  ${fan##*/} $(cat $fan) rpm"
+    done
+    for temp in $monitor/temp*_input; do
+        [ -e "$temp" ] && echo "  ${temp##*/} $(( $(cat $temp) / 1000 )) C"
+    done | head -n 12
+done
+
+section "Modules"
+cat /proc/modules | cut -d' ' -f1 | tr '\n' ' '
+echo
+
+section "Processes"
+ps

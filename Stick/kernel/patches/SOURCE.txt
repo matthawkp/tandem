@@ -1,0 +1,4 @@
+82b323df4b4e6e022af36a1e4d3de59e2184d27d
+iMac5K-7.3.0.patch is from https://github.com/taprobane99/iMac5KLinux at the commit above
+(MIT, see LICENSE.iMac5KLinux). It wakes the second half of the 5K iMac panel so Linux can
+drive it as two 2560x2880 tiles. Unmodified.

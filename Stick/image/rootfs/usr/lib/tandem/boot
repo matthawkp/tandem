@@ -1,0 +1,119 @@
+#!/bin/sh
+# Runs once, first.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts /dev/shm /run /tmp /boot-media
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o mode=1777 tmpfs /dev/shm
+mount -t tmpfs -o mode=755 tmpfs /run
+mount -t tmpfs -o mode=1777 tmpfs /tmp
+mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+mkdir -p /run/tandem
+. /usr/lib/tandem/functions
+
+hostname tandem-display
+ip link set lo up
+say "Tandem Display $(cat /usr/share/tandem/version), Linux $(uname -r), $(cat /sys/class/dmi/id/product_name 2>/dev/null)"
+# What the boot loader said: how it found the stick, and how far the picture got (grub.cfg).
+say "boot loader: $(tr ' ' '\n' < /proc/cmdline | grep '^tandem\.[a-z]*=' | tr '\n' ' ')"
+
+# Room for whole frames in the socket's buffer: a 5K frame is 59 MB before compression.
+echo 33554432 > /proc/sys/net/core/rmem_max
+echo 33554432 > /proc/sys/net/core/wmem_max
+echo "4096 1048576 33554432" > /proc/sys/net/ipv4/tcp_rmem
+
+# The stick this started from: settings are read from it, and logs written to it.
+: > $RUN/tandem.conf
+tries=0
+while [ $tries -lt 40 ]; do
+    device=$(findfs LABEL=TANDEM 2>/dev/null) && break
+    tries=$((tries + 1))
+    sleep 0.25
+done
+if [ -n "$device" ] && mount -t vfat -o ro,utf8,shortname=mixed "$device" $MEDIA 2>/dev/null; then
+    echo "$device" > $RUN/media
+    [ -f $MEDIA/tandem.conf ] && tr -d '\r' < $MEDIA/tandem.conf > $RUN/tandem.conf
+    count=$(cat $MEDIA/tandem-logs/count 2>/dev/null | tr -cd 0-9)
+    echo $(( ${count:-0} + 1 )) > $RUN/boot-number
+    say "settings and logs on $device (boot $(cat $RUN/boot-number))"
+else
+    say "couldn't find the TANDEM stick: using default settings, and logs won't be kept"
+fi
+
+# The graphics driver, in the background: it takes several seconds, and if it goes wrong the
+# rest still starts and the logs still get written.
+#
+# The display program waits for $RUN/screen-ready before it looks at the screens: see
+# /usr/lib/tandem/display.
+release=$(uname -r)
+amd=no
+for vendor in /sys/bus/pci/devices/*/vendor; do
+    [ "$(cat $vendor)" = "0x1002" ] && case "$(cat ${vendor%vendor}class)" in 0x03*) amd=yes ;; esac
+done
+if on_cmdline tandem.nogpu; then
+    say "boot menu: no graphics driver (the firmware's framebuffer, drawn by the CPU)"
+    touch $RUN/screen-ready
+elif [ $amd = yes ]; then
+    driver=/lib/modules/$release/kernel/drivers/gpu/drm/amd/amdgpu/amdgpu.ko
+    if on_cmdline tandem.stock && [ ! -f /usr/lib/tandem/amdgpu-stock.ko ]; then
+        say "boot menu: the graphics driver without the 5K patch, but it isn't here (tandem/stock.zst on the stick): the patched one instead"
+    elif on_cmdline tandem.stock; then
+        say "boot menu: the graphics driver without the 5K patch"
+        # The patched one is kept, so it can be tried by hand without starting again.
+        cp $driver /usr/lib/tandem/amdgpu-patched.ko
+        cp /usr/lib/tandem/amdgpu-stock.ko $driver
+    else
+        say "boot menu: the graphics driver with the 5K patch"
+    fi
+    say "loading the graphics driver"
+    # On the stick before it loads: if the driver stops the machine dead, the logs still say
+    # how far things got.
+    /usr/lib/tandem/save-logs
+    (
+        modprobe amdgpu 2>&1 | while read -r line; do say "modprobe: $line"; done
+        say "graphics driver loaded"
+        on_cmdline tandem.stock || /usr/lib/tandem/panel-halves
+        touch $RUN/screen-ready
+        /usr/lib/tandem/save-logs
+    ) &
+else
+    say "no AMD graphics here"
+    touch $RUN/screen-ready
+fi
+
+# Bonjour, which is how Tandem on the Mac finds this.
+name=$(conf name "")
+[ -z "$name" ] && case "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" in
+    iMacPro*) name="iMac Pro" ;; iMac*) name="iMac" ;; MacBook*) name="MacBook" ;; Macmini*) name="Mac mini" ;; MacPro*) name="Mac Pro" ;; *) name="Tandem Display" ;;
+esac
+echo "$name" > $RUN/name
+escaped=$(echo "$name" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+cat > /etc/avahi/services/tandem.service <<SERVICE
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name>$escaped</name>
+  <service><type>_tandem._tcp</type><port>51515</port></service>
+</service-group>
+SERVICE
+interfaces="thunderbolt0,thunderbolt1,thunderbolt2,thunderbolt3"
+on_cmdline tandem.test && interfaces="$interfaces,eth0"
+sed -i "s/^allow-interfaces=.*/allow-interfaces=$interfaces/" /etc/avahi/avahi-daemon.conf
+mkdir -p /run/avahi-daemon
+avahi-daemon -D --no-chroot 2>&1 | while read -r line; do say "avahi: $line"; done
+
+# A way in for looking at what went wrong: SSH, with one key, over the cable only (nothing
+# else is ever brought up).
+# The key can come from the stick (tandem/authorized_keys); the host key is made on the first
+# connection if the image has none.
+[ -s $MEDIA/tandem/authorized_keys ] && tr -d '\r' < $MEDIA/tandem/authorized_keys > /root/.ssh/authorized_keys &&
+    chmod 600 /root/.ssh/authorized_keys
+if [ "$(conf ssh yes)" = yes ] && [ -s /root/.ssh/authorized_keys ]; then
+    dropbear -R -s -p 22 2>&1 | while read -r line; do say "ssh: $line"; done
+    say "ssh: listening (key only)"
+fi
+
+# Logs to the stick: soon after starting, again once things have settled, then now and then.
+( sleep 25; /usr/lib/tandem/save-logs; sleep 60; /usr/lib/tandem/save-logs; while sleep 900; do /usr/lib/tandem/save-logs; done ) > /dev/null 2>&1 &

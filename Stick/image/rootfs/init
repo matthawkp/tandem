@@ -1,0 +1,4 @@
+#!/bin/sh
+# The kernel starts this from the initramfs, which is the whole system: nothing is installed
+# and no disk is used. BusyBox init then follows /etc/inittab.
+exec /sbin/init

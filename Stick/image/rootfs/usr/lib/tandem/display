@@ -1,0 +1,44 @@
+#!/bin/sh
+# Runs the display program, again and again: init starts this whenever it ends.
+. /usr/lib/tandem/functions
+
+set -- --font /usr/share/tandem/font.psf --name "$(cat $RUN/name 2>/dev/null)"
+mode=$(conf mode "");                [ -n "$mode" ] && set -- "$@" --mode "$mode"
+size=$(conf size_mm "");             [ -n "$size" ] && set -- "$@" --size-mm "$size"
+backlight=$(conf backlight "");      [ -n "$backlight" ] && set -- "$@" --backlight "$backlight"
+speed=$(conf pointer_speed "");      [ -n "$speed" ] && set -- "$@" --pointer-speed "$speed"
+sleep_mode=$(conf sleep "");         [ -n "$sleep_mode" ] && set -- "$@" --sleep "$sleep_mode"
+minutes=$(conf idle_blank_minutes ""); [ -n "$minutes" ] && set -- "$@" --idle-blank $(( $(echo "$minutes" | tr -cd 0-9) * 60 ))
+[ "$(conf swap_halves no)" = yes ] && set -- "$@" --swap-tiles
+# The log, faintly, on the waiting screen: if asked for, and always when finding faults.
+[ "$(conf show_log no)" = yes ] || on_cmdline tandem.nogpu || set -- "$@" --no-log
+[ "$(conf keyboard_and_mouse yes)" = no ] && set -- "$@" --no-input
+[ "$(conf debug no)" = yes ] && set -- "$@" --debug
+# For testing: a checksum of every frame, to compare with the sender's. Slow.
+[ "$(conf debug no)" = all ] && set -- "$@" --hash-all
+on_cmdline tandem.nogpu && set -- "$@" --firmware-framebuffer
+on_cmdline tandem.test && set -- "$@" --any-interface --firmware-framebuffer
+
+# Not before the graphics driver has found the whole panel (see /usr/lib/tandem/boot), or the
+# picture's size is chosen from what the panel said before it switched to two halves.
+tries=0
+while [ ! -f $RUN/screen-ready ] && [ $tries -lt 120 ]; do
+    sleep 0.25
+    tries=$((tries + 1))
+done
+
+# The GPU's shader cache has nowhere to go, and nothing would be there next time anyway.
+export HOME=/root XDG_RUNTIME_DIR=/run MESA_SHADER_CACHE_DISABLE=true
+echo "--- $(cut -d' ' -f1 /proc/uptime) tandem-display $*" >> $RUN/display.log
+/usr/bin/tandem-display "$@" 2>> $RUN/display.log
+status=$?
+
+if [ $status = 42 ]; then
+    say "power button: shutting down"
+    poweroff
+    sleep 60
+fi
+say "the display program stopped (status $status); its last words:"
+[ -n "$QUIET" ] || tail -n 6 $RUN/display.log
+/usr/lib/tandem/save-logs
+sleep 3

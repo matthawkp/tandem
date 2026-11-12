@@ -1,0 +1,33 @@
+#!/bin/sh
+# Brings the Thunderbolt cable's network interface up whenever a Mac is plugged in: an IPv6
+# link-local address comes by itself, and an IPv4 one (169.254.x.y) is added beside it.
+. /usr/lib/tandem/functions
+
+up() {
+    interface=$1
+    [ "$(cat /sys/class/net/$interface/flags 2>/dev/null)" ] || return
+    if ! ip link show "$interface" | grep -q '[<,]UP[,>]'; then
+        ip link set "$interface" up && say "network: $interface up"
+    fi
+    if ! ip -4 addr show "$interface" | grep -q 'inet '; then
+        # From the interface's own address, so it's the same every time.
+        mac=$(cat /sys/class/net/$interface/address | tr -d :)
+        third=$(( 0x$(echo "$mac" | cut -c9-10) % 254 + 1 ))
+        fourth=$(( 0x$(echo "$mac" | cut -c11-12) % 254 + 1 ))
+        ip addr add 169.254.$third.$fourth/16 broadcast 169.254.255.255 dev "$interface" 2>/dev/null &&
+            say "network: $interface is 169.254.$third.$fourth"
+    fi
+}
+
+if on_cmdline tandem.test && [ ! -f $RUN/test-network ]; then
+    # In a virtual machine, for testing: ordinary Ethernet stands in for the cable.
+    touch $RUN/test-network
+    ip link set eth0 up && udhcpc -i eth0 -q -n -t 5 2>&1 | while read -r line; do say "dhcp: $line"; done
+fi
+
+while :; do
+    for path in /sys/class/net/thunderbolt*; do
+        [ -e "$path" ] && up "${path##*/}"
+    done
+    sleep 1
+done

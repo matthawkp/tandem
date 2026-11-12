@@ -1,0 +1,69 @@
+#!/bin/sh
+# After the patched graphics driver loads: has the 5K panel answered as its two halves?
+#
+# The firmware leaves the panel in its 3840x2160 compatibility mode, and the driver reads the
+# panel's description (EDID) on the internal link (eDP) before the panel has switched to two
+# halves. The second half (DP-1) comes up as a 2560x2880 tile, but eDP-1 goes on describing one
+# 3840x2160 panel until it's looked at again. A hotplug, asked for through debugfs, makes the
+# driver read it again; then both connectors say they're tiles of one 5120x2880 display.
+#
+# Seen on an iMac19,1: before, DP-1 2560x2880 and eDP-1 3840x2160; after, both 2560x2880.
+. /usr/lib/tandem/functions
+
+# Asks every connector for its modes afresh (the lists in sysfs are only as new as the last
+# time something asked), then says what they are.
+probe() {
+    for connector in /sys/class/drm/card*-*DP-*; do
+        [ -e "$connector/status" ] && echo detect > $connector/status 2>/dev/null
+    done
+}
+status() {
+    for connector in /sys/class/drm/card*-*DP-*; do
+        [ -e "$connector/status" ] || continue
+        modes=$(head -n 1 $connector/modes 2>/dev/null)
+        echo -n "${connector##*/}: $(cat $connector/status)${modes:+ ($modes)}; "
+    done
+}
+# Two connectors whose preferred mode is taller than wide: the panel's two halves.
+halves() {
+    count=0
+    for connector in /sys/class/drm/card*-*DP-*; do
+        [ "$(cat $connector/status 2>/dev/null)" = connected ] || continue
+        mode=$(head -n 1 $connector/modes 2>/dev/null)
+        width=${mode%%x*}; height=${mode#*x}; height=${height%%[!0-9]*}
+        [ -n "$width" ] && [ -n "$height" ] && [ "$height" -gt "$width" ] && count=$((count + 1))
+    done
+    [ $count -ge 2 ]
+}
+
+edp=
+for directory in /sys/kernel/debug/dri/*/eDP-*; do
+    [ -e "$directory/trigger_hotplug" ] && { edp=$directory; break; }
+done
+if [ -z "$edp" ]; then
+    say "screen: no internal panel link in debugfs, nothing to look at again"
+    exit 0
+fi
+
+probe
+say "screen: before looking again: $(status)"
+if halves; then
+    say "screen: both halves already there"
+    exit 0
+fi
+echo 1 > $edp/allow_edp_hotplug_detection 2>/dev/null
+if ! echo 1 > $edp/trigger_hotplug 2>/dev/null; then
+    say "screen: couldn't ask $edp to look again"
+    exit 0
+fi
+# The new description takes a moment to arrive.
+tries=0
+until [ $tries -ge 24 ]; do
+    sleep 0.25
+    probe
+    halves && break
+    tries=$((tries + 1))
+done
+say "screen: after looking again: $(status)"
+halves || say "screen: still only one half: the picture will be 3840x2160"
+exit 0

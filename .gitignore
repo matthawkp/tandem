@@ -24,3 +24,6 @@ ExportOptions.plist
 Promo/
 
 .DS_Store
+
+# The flash drive's build: kernel, image, logs, and the SSH key a build of your own makes
+Stick/out/
