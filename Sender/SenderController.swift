@@ -97,6 +97,13 @@ final class SenderController: @unchecked Sendable {
     private let inputPlayer = InputPlayer()
     private let remotePeek = RemotePeek()
     private let fileReceiver = FileReceiver()
+    /// ⌃⌥1, ⌃⌥2, ⌃⌥← and ⌃⌥→, while the display Mac has more than one Mac connected.
+    private let switchKeys = SwitchHotKeys()
+    /// The Macs the display Mac has connected, and which it shows. Nil from a display Mac with
+    /// only ever one, or one that doesn't switch: this Mac is then always shown.
+    private(set) var lineup: Lineup?
+    /// The display Mac shows this Mac's picture, rather than another Mac's.
+    var isShown: Bool { lineup?.youAreShown ?? true }
     private var sentInputState: Wire.InputState?
     /// Link test, on netQueue: when the first reply came, and how many are still to come.
     private var probe: (first: DispatchTime?, remaining: Int)?
@@ -156,6 +163,7 @@ final class SenderController: @unchecked Sendable {
         remotePeek.send = { [weak self] command in self?.channel?.send(.peek, Data([command.rawValue])) }
         remotePeek.sendInput = { [weak self] input in self?.channel?.send(.input, input.encoded()) }
         remotePeek.displayID = { [weak self] in self?.screen?.displayID }
+        switchKeys.onPress = { [weak self] request, number in self?.show(request, number) }
         fileReceiver.folder = { Self.folder(at: $0) }
         fileReceiver.onSaved = { Self.placeOnDesktop($0, at: $1) }
         startStatsTimer()
@@ -209,7 +217,7 @@ final class SenderController: @unchecked Sendable {
     /// Stops frames going out, or lets them go again. Stopping waits for a frame being encoded,
     /// so whatever is sent next (why the picture is going, say) comes after the last frame.
     private func setSending(_ on: Bool) {
-        let channel = on && hello != nil ? self.channel : nil
+        let channel = on && hello != nil && isShown ? self.channel : nil
         encodeQueue.sync { sendChannel = channel }
     }
 
@@ -363,7 +371,14 @@ final class SenderController: @unchecked Sendable {
                     case .open, .close, .stepThrough, .comeBack: break
                     }
                 }
-            case .frame, .status, .ping, .display, .probe, .inputState, .cameraFrame, .about, .cursor, .cursorShape, .settingsChoice, .features:
+            case .lineup:
+                guard let lineup = try? JSONDecoder().decode(Lineup.self, from: body) else { return }
+                DispatchQueue.main.async {
+                    guard self.channel === channel else { return }
+                    self.lineupChanged(lineup)
+                }
+            case .frame, .status, .ping, .display, .probe, .inputState, .cameraFrame, .about, .cursor, .cursorShape,
+                 .settingsChoice, .features, .show:
                 break
             }
         }
@@ -444,7 +459,12 @@ final class SenderController: @unchecked Sendable {
     }
 
     /// The other Mac can take over extending, so the two can swap roles in one go.
-    var peerCanSwap: Bool { channel != nil && hello?.capabilities.contains(.swap) == true }
+    /// Not while another Mac is connected to it too, which would lose its display.
+    var peerCanSwap: Bool { channel != nil && hello?.capabilities.contains(.swap) == true && (lineup?.macs.count ?? 1) <= 1 }
+    /// Connected to a display with no macOS of its own (Tandem Display, from a flash drive):
+    /// peeking, files, its settings and its camera need Tandem on macOS there. Only Tandem on a
+    /// Mac peeks.
+    var peerHasNoDesktop: Bool { channel != nil && hello != nil && hello?.capabilities.contains(.peek) != true }
 
     /// Asks the other Mac to start extending, then calls `done` once the message is on its way
     /// (or after a second, if the link has gone quiet).
@@ -474,7 +494,7 @@ final class SenderController: @unchecked Sendable {
         var features = Data()
         features.appendLE(Wire.Capabilities([.files, .swap]).rawValue)
         channel.send(.features, features)
-        remotePeek.available = hello.capabilities.contains(.peek)
+        remotePeek.available = hello.capabilities.contains(.peek) && isShown
         if !hello.capabilities.contains(.brightness) {
             receiverBrightness = nil
         } else if hello.brightness >= 0 {
@@ -533,7 +553,7 @@ final class SenderController: @unchecked Sendable {
             encoder = TileEncoder(width: hello.width, height: hello.height, bc7: hello.capabilities.contains(.bc7))
             encoder?.quality = quality
             if let knownRate { encoder?.linkBytesPerSecond = knownRate }
-            sendChannel = channel
+            sendChannel = isShown ? channel : nil
             latest = nil
             lastBuffer = nil
             inFlight = 0
@@ -542,6 +562,7 @@ final class SenderController: @unchecked Sendable {
             lastFrameSent = nil
         }
         startDisplaySync()
+        guard isShown else { return wentOutOfView() }
         startCursor(hello, on: channel)
 
         if options.synthetic {
@@ -556,6 +577,8 @@ final class SenderController: @unchecked Sendable {
 
     private func disconnected(_ error: Error?) {
         log("disconnected\(error.map { ": \($0)" } ?? "")")
+        lineup = nil
+        switchKeys.enabled = false
         remotePeek.available = false
         receiverSettings = nil
         cursorTracker?.stop()
@@ -775,6 +798,64 @@ final class SenderController: @unchecked Sendable {
         }
     }
 
+    // MARK: Several Macs on one display
+
+    /// Asks the display Mac to show another Mac, or this one: from the switching keys or the menu.
+    func show(_ request: Wire.Show, _ number: Int) {
+        guard let channel, hello != nil else { return }
+        channel.send(.show, Data([request.rawValue, UInt8(clamping: number)]))
+    }
+
+    private func lineupChanged(_ lineup: Lineup) {
+        let wasShown = isShown
+        self.lineup = lineup
+        switchKeys.enabled = lineup.macs.count > 1
+        if isShown != wasShown, hello != nil {
+            if isShown { cameIntoView() } else { wentOutOfView() }
+        }
+        onChange?()
+    }
+
+    /// The display Mac now shows another Mac. This one keeps its display, so its windows stay
+    /// put, but stops capturing and sending until it's shown again.
+    private func wentOutOfView() {
+        let other = lineup?.shown?.name ?? "another Mac"
+        log("the \(peerKind) is showing \(other)")
+        setSending(false)
+        isStreaming = false
+        remotePeek.available = false
+        cursorTracker?.stop()
+        cursorTracker = nil
+        let capture = self.capture
+        Task { await capture.stop() }
+        setStatus("Showing \(other)")
+    }
+
+    private func cameIntoView() {
+        guard let hello, let channel else { return }
+        log("the \(peerKind) is showing this Mac")
+        // From scratch: the display has been showing another Mac's picture.
+        encodeQueue.sync {
+            encoder?.invalidate()
+            latest = nil
+            lastBuffer = nil
+            inFlight = 0
+            unacked = [:]
+            lastAck = nil
+            lastFrameSent = nil
+        }
+        setSending(true)
+        remotePeek.available = hello.capabilities.contains(.peek)
+        startCursor(hello, on: channel)
+        if options.synthetic {
+            isStreaming = true
+            setStatus("Streaming test pattern")
+        } else {
+            setStatus("Connecting…")
+            startCapture()
+        }
+    }
+
     // MARK: Pointer
 
     /// Receivers that draw the pointer themselves get it as messages, and a picture without it.
@@ -794,8 +875,9 @@ final class SenderController: @unchecked Sendable {
     // MARK: Capture
 
     private func startCapture() {
-        // Capture fails while the screens are off; it restarts when they turn back on.
-        guard let screen, let hello, !screensOff else { return }
+        // Capture fails while the screens are off; it restarts when they turn back on. Nor while
+        // the display Mac shows another Mac.
+        guard let screen, let hello, !screensOff, isShown else { return }
         if !CGPreflightScreenCaptureAccess() {
             needsPermission = true
             log("no Screen Recording permission")
@@ -814,7 +896,7 @@ final class SenderController: @unchecked Sendable {
                 self.encodeQueue.async { self.encoder?.invalidate() }
                 DispatchQueue.main.async {
                     // The link or the display may have gone while capture was starting.
-                    guard self.hello != nil, self.screen?.displayID == displayID else { return }
+                    guard self.hello != nil, self.screen?.displayID == displayID, self.isShown else { return }
                     self.isStreaming = true
                     self.setStatus("Connected")
                 }

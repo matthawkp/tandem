@@ -28,6 +28,10 @@ import os
 //                               whose picture then comes without the pointer: they draw it
 //                               themselves, so it moves at once instead of with the next frame.
 //   cursorShape (sender -> receiver) CursorShape: the pointer's image, when it changes
+//   lineup (receiver -> sender) Lineup as JSON: with more than one Mac connected (one on each
+//                               Thunderbolt port), which are connected and which is shown. A Mac
+//                               that isn't shown sends no frames until it is.
+//   show  (sender -> receiver)  u8 Show, u8 number: show another Mac (⌃⌥1, ⌃⌥→… on its keyboard)
 //
 // The camera has its own service (cameraServiceType, cameraPort), used by the sender's camera
 // switcher, which serves the result to its camera extension on switcherPort:
@@ -76,6 +80,15 @@ enum Wire {
         case file = 20
         /// From the extending Mac: a UInt16 of its own `Capabilities`, sent after the hello.
         case features = 21
+        // 22 is pairing, which Tandem Display asks of senders on networks other than the
+        // Thunderbolt cable (see Stick/receiver/tandem.h). This app only talks over the cable.
+        /// From the display Mac, to each Mac connected to it: a `Lineup` as JSON, the Macs it can
+        /// show and which one it shows. A Mac that isn't shown stops sending its picture, keeping
+        /// its display (and the windows on it) until it's shown again. Older versions ignore it,
+        /// and so are always shown.
+        case lineup = 23
+        /// From an extending Mac: a `Show`, asking the display Mac to show another Mac, or itself.
+        case show = 24
     }
 
     /// Bumped whenever the two apps stop understanding each other.
@@ -103,6 +116,12 @@ enum Wire {
         static let settings = Capabilities(rawValue: 32)
         /// From the extending Mac: takes files pulled through the bubble.
         static let files = Capabilities(rawValue: 64)
+        /// Decodes HEVC or H.264 rects (encodings 4 and 5): video from senders without Tandem's
+        /// tile encoder, i.e. Tandem for Windows. One access unit per rect, Annex B, scaled to
+        /// fill the rect. Only Tandem Display (the iMac flash drive) says so for now; this app's
+        /// receiver turns such rects down, and Wire.Encoding has no case for them.
+        static let hevc = Capabilities(rawValue: 128)
+        static let h264 = Capabilities(rawValue: 256)
     }
 
     /// Peeking from the extending Mac's own keyboard and trackpad.
@@ -130,6 +149,14 @@ enum Wire {
     /// start again in their new roles.
     enum Swap: UInt8 {
         case now = 1
+    }
+
+    /// Which Mac to show, asked for from an extending Mac's keyboard or menu. `number` is
+    /// followed by one more byte, the Mac's number in the `Lineup`.
+    enum Show: UInt8 {
+        case number = 0
+        case next = 1
+        case previous = 2
     }
 
     enum Power: UInt8 {
@@ -180,6 +207,24 @@ enum Wire {
         }
         return params
     }
+}
+
+/// The Macs a display Mac has connected (one on each Thunderbolt port, say) and the one it shows.
+/// Each is told which one it is.
+struct Lineup: Codable, Equatable {
+    struct Mac: Codable, Equatable {
+        var name: String
+        /// Kept by the display Mac for each Mac it has seen, from 1: ⌃⌥1 shows Mac 1.
+        var number: Int
+        var shown: Bool
+        /// The Mac this lineup was sent to.
+        var you: Bool
+    }
+
+    var macs: [Mac]
+
+    var youAreShown: Bool { macs.contains { $0.you && $0.shown } }
+    var shown: Mac? { macs.first { $0.shown } }
 }
 
 struct Hello {

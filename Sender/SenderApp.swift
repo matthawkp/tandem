@@ -123,10 +123,28 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(allow)
         }
 
+        // With more than one Mac connected to the display: which one it shows.
+        if let macs = controller.lineup?.macs, macs.count > 1 {
+            menu.addItem(.separator())
+            menu.addItem(.sectionHeader(title: "Show on \(peer)"))
+            for mac in macs.sorted(by: { $0.number < $1.number }) {
+                let show = item(mac.you ? "This \(this)" : mac.name, #selector(showMac(_:)))
+                show.tag = mac.number
+                show.state = mac.shown ? .on : .off
+                if (1...9).contains(mac.number) {
+                    // Shown for the keys that do the same from any of the keyboards.
+                    show.keyEquivalent = "\(mac.number)"
+                    show.keyEquivalentModifierMask = [.control, .option]
+                }
+                menu.addItem(show)
+            }
+        }
+
         // The display. Live controls only while there is one; settings always.
         menu.addItem(.separator())
         menu.addItem(.sectionHeader(title: "Display"))
-        if let brightness = controller.receiverBrightness {
+        // Only while it shows this Mac: otherwise it's another Mac's brightness that shows.
+        if let brightness = controller.receiverBrightness, controller.isShown {
             let row = NSMenuItem()
             let slider = sliderView(value: brightness, range: 0...1, low: "sun.min", high: "sun.max",
                                     label: "\(peer) Brightness", action: #selector(brightnessChanged(_:)))
@@ -188,6 +206,20 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(pointerMenuItem())
         menu.addItem(cameraMenuItem())
 
+        // What a display without macOS (Tandem Display on a flash drive) can't do, greyed out,
+        // so it's clear why rather than just missing.
+        if controller.peerHasNoDesktop {
+            menu.addItem(.separator())
+            menu.addItem(.sectionHeader(title: "Needs macOS on the \(peer)"))
+            let why = "The \(peer) is running Tandem Display, which has no desktop of its own. This needs Tandem on macOS there."
+            for title in ["Peek Through to the \(peer)", "Bring Files Across", "\(peer) Settings"] {
+                let unavailable = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                unavailable.isEnabled = false
+                unavailable.toolTip = why
+                menu.addItem(unavailable)
+            }
+        }
+
         menu.addItem(.separator())
         menu.addItem(toggle("Sleep \(peer) with \(this)", prefs.sleepsReceiver, #selector(toggleSleep)))
         menu.addItem(toggle("Wake \(peer) with \(this)", prefs.wakesReceiver, #selector(toggleWake)))
@@ -248,11 +280,17 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ("\(peer) Camera", .remote, "Always the \(peer)'s camera."),
             ("\(this) Camera", .local, "Always the \(this)'s camera."),
         ]
+        // A display without macOS has no camera to offer.
+        let noRemoteCamera = controller.peerHasNoDesktop
         for (title, mode, tip) in modes {
             let option = self.item(title, #selector(chooseCameraMode(_:)))
             option.representedObject = mode.rawValue
             option.state = prefs.cameraMode == mode ? .on : .off
             option.toolTip = tip
+            if noRemoteCamera && mode != .local {
+                option.isEnabled = false
+                option.toolTip = "The \(peer) is running Tandem Display, which has no camera to offer: only the \(this)'s."
+            }
             sub.addItem(option)
         }
         if prefs.cameraMode == .automatic {
@@ -481,6 +519,10 @@ final class SenderApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleSleep() {
         controller.prefs.sleepsReceiver.toggle()
+    }
+
+    @objc private func showMac(_ item: NSMenuItem) {
+        controller.show(.number, item.tag)
     }
 
     @objc private func toggleWake() {

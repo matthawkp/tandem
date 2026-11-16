@@ -30,6 +30,11 @@ final class InputCapture {
     var takesClick: (CGEvent) -> Bool = { _ in false }
     /// The Mac being controlled, for the messages.
     var peerKind = "Mac"
+    /// ⌃⌥ with a number or an arrow: show another Mac. True if it was used (there's more than
+    /// one Mac connected), and the key then stays here rather than going to the Mac.
+    var onSwitchKey: (Wire.Show, Int) -> Bool = { _, _ in false }
+    /// Keys used to switch Macs, whose release is used up too.
+    private var switchKeysDown = Set<Int64>()
 
     private let window: NSWindow
     private let hud: InputHUD
@@ -127,6 +132,8 @@ final class InputCapture {
         // Played here from the other Mac's keyboard and trackpad, not this Mac's own.
         if event.isFromOtherMac { return false }
         let type = event.type
+        if let request = SwitchKey.request(for: event), handleSwitchKey(event, request) { return true }
+        if type == .keyUp, switchKeysDown.remove(event.getIntegerValueField(.keyboardEventKeycode)) != nil { return true }
         if type == .flagsChanged {
             let keys = event.modifierKeys
             if keys == .peekKeys {
@@ -165,6 +172,19 @@ final class InputCapture {
             return false
         }
         return forward(event)
+    }
+
+    /// True if the key was used to switch Macs.
+    private func handleSwitchKey(_ event: CGEvent, _ request: (Wire.Show, Int)) -> Bool {
+        let code = event.getIntegerValueField(.keyboardEventKeycode)
+        if event.type == .keyUp { return switchKeysDown.remove(code) != nil }
+        // Held down, it switches once.
+        if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 { return switchKeysDown.contains(code) }
+        armed = false
+        hold?.cancel()
+        guard onSwitchKey(request.0, request.1) else { return false }
+        switchKeysDown.insert(code)
+        return true
     }
 
     /// Held long enough, Control-Option is a peek, and letting go no longer toggles.

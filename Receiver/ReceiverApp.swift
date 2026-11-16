@@ -95,7 +95,19 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     private var input: InputCapture!
     private var hello: Hello!
     private var listener: NWListener?
-    private var channel: MessageChannel?
+    /// Every Mac connected, one per Thunderbolt port, and the one shown. The rest wait, keeping
+    /// their displays, until they're shown.
+    private var sources: [Source] = []
+    private var active: Source?
+    /// The shown Mac's connection.
+    private var channel: MessageChannel? { active?.channel }
+    /// The Mac last chosen with ⌃⌥ and a number or arrow: shown again whenever it connects.
+    private var chosenMac: String? {
+        get { UserDefaults.standard.string(forKey: "chosenMac") }
+        set { UserDefaults.standard.set(newValue, forKey: "chosenMac") }
+    }
+    /// In case a Mac that's been shown never sends a picture.
+    private var pictureCheck: DispatchWorkItem?
     private var sleepAssertion: IOPMAssertionID = 0
     private var disconnectedSleep: DisconnectedSleep?
     private let camera = CameraServer()
@@ -107,7 +119,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     /// The Mac whose display this shows, for wording.
     private var peerKind = Peer.last?.kind ?? "Mac"
     /// The connected Mac can become a display, so the two can swap roles in one go.
-    private var senderCanSwap = false
+    private var senderCanSwap: Bool { active?.canSwap ?? false }
     private let fileSender = FileSender()
     private var hud: InputHUD!
     private lazy var permissionsWindow: PermissionsWindow = {
@@ -116,7 +128,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
         return permissions
     }()
     /// The other Mac takes files pulled through the bubble.
-    private var senderTakesFiles = false
+    private var senderTakesFiles: Bool { active?.takesFiles ?? false }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenu()
@@ -190,6 +202,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
         input.onPeekHold = { [weak self] in self?.peek.heldHere() }
         input.takesClick = { [weak self] event in self?.peek.takesClick(event) ?? false }
         input.onLocalMouse = { [weak self] in self?.peek.macPointerMovedLast = false }
+        input.onSwitchKey = { [weak self] show, number in self?.switchKey(show, number) ?? false }
         cursorOverlay.onMove = { [weak self] in
             guard let self, self.cursorOverlay.hotspot != nil else { return }
             self.peek.macPointerMovedLast = true
@@ -412,23 +425,57 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
         MonitorMode.setRestartsAfterPowerFailure(!MonitorMode.restartsAfterPowerFailure) { [weak self] in self?.sendSettings() }
     }
 
-    private func met(_ peer: Peer) {
-        log("showing \(peer.name), a \(peer.kind)")
+    /// A Mac has said who it is. It's shown if it's the one last chosen, or if the one shown has
+    /// nothing to show; otherwise it waits, and the HUD says how to show it.
+    private func met(_ peer: Peer, _ source: Source) {
+        source.peer = peer
+        if source.number == 0 {
+            source.number = MacNumbers.number(for: peer.name, connected: sources.compactMap { $0.peer?.name })
+        }
+        log("\(peer.name), a \(peer.kind), is Mac \(source.number)")
+        defer {
+            sendSettings(to: source)
+            sendLineup()
+        }
+        // The same Mac again, before its last connection has timed out: this one takes its place.
+        if let stale = sources.first(where: { $0 !== source && $0.peer?.name == peer.name }) {
+            log("\(peer.name) connected again, dropping its last connection")
+            if active === stale { show(source, quietly: true) }
+            // Gone from the lineup now, rather than once it has closed.
+            sources.removeAll { $0 === stale }
+            stale.channel.cancel()
+        }
+        if active === source {
+            // The only Mac, so it's the one to come back to when another has been shown since.
+            if sources.count == 1 { chosenMac = peer.name }
+            return showingPeer(peer)
+        }
+        guard let active else { return }
+        if peer.name == chosenMac && active.name != chosenMac {
+            show(source, clearing: !streaming)
+        } else if !active.hasPicture {
+            show(source, clearing: true)
+        } else if source.number > 0 {
+            hud.show("\(peer.name) is connected too", "Press ⌃⌥\(source.number) to show it, and ⌃⌥\(active.number) to come back.")
+        }
+    }
+
+    /// Wording for the Mac shown.
+    private func showingPeer(_ peer: Peer) {
         Peer.last = peer
         peerKind = peer.kind
         splash.peerKind = peer.kind
         input.peerKind = peer.kind
-        sendSettings()
     }
 
     private static func describe(_ urls: [URL]) -> String {
         urls.count == 1 ? "“\(urls[0].lastPathComponent)”" : "\(urls.count) items"
     }
 
-    /// Lets the other Mac show this Mac's settings in its own Tandem menu.
-    private func sendSettings() {
-        guard let channel, let data = try? JSONEncoder().encode(RemoteMenu(settingsMenu())) else { return }
-        channel.send(.settings, data)
+    /// Lets the other Macs show this Mac's settings in their own Tandem menus.
+    private func sendSettings(to only: Source? = nil) {
+        guard !sources.isEmpty, let data = try? JSONEncoder().encode(RemoteMenu(settingsMenu())) else { return }
+        for source in only.map({ [$0] }) ?? sources { source.channel.send(.settings, data) }
     }
 
     /// A setting chosen from the other Mac's menu: chosen here, then the new state sent back.
@@ -442,7 +489,8 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.sendSettings() }
     }
 
-    private var canSwap: Bool { channel != nil && senderCanSwap && Role.canExtend }
+    /// Not with another Mac connected too, which would lose its display.
+    private var canSwap: Bool { channel != nil && sources.count == 1 && senderCanSwap && Role.canExtend }
 
     @objc private func switchRole() {
         let alert = NSAlert()
@@ -513,158 +561,339 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     }
 
     private func accept(_ connection: NWConnection) {
-        channel?.cancel()
         let channel = MessageChannel(connection, queue: netQueue)
+        let source = Source(channel: channel)
         var hello = self.hello!
         if renderer.supportsBC7 { hello.capabilities.insert(.bc7) }
         hello.capabilities.insert(.cursor)
         if Role.canExtend { hello.capabilities.insert(.swap) }
         hello.capabilities.formUnion([.peek, .settings])
-        cursorOverlay.reset()
         // Even while the screen is asleep (just woken from sleep, say): the brightness is then
         // unknown, and set once the screen is back.
         if options.windowedSize == nil, BuiltInBrightness.hasPanel {
             hello.capabilities.insert(.brightness)
-            hello.brightness = BuiltInBrightness.get() ?? -1
         }
-        channel.onReady = { [weak channel, hello] in channel?.send(.hello, hello.encoded()) }
-        // Whether this connection's picture is showing, as far as its messages say, in the order
-        // they came: on the network queue only. `streaming` itself belongs to the main thread.
-        var showing = false
-        channel.onMessage = { [weak self, weak channel] kind, body in
-            guard let self else { return }
-            if kind == .status {
-                showing = false
-                let text = String(decoding: body, as: UTF8.self)
-                log("status from sender: \(text)")
-                DispatchQueue.main.async { self.senderStatus(text) }
+        channel.onReady = { [weak self, weak source] in
+            DispatchQueue.main.async {
+                guard let self, let source, self.sources.contains(where: { $0 === source }) else { return }
+                // A Mac that isn't shown hears so first, so it doesn't start sending its picture.
+                if !source.isShown { self.sendLineup(to: source) }
+                var hello = hello
+                if hello.capabilities.contains(.brightness) { hello.brightness = BuiltInBrightness.get() ?? -1 }
+                source.channel.send(.hello, hello.encoded())
+            }
+        }
+        channel.onMessage = { [weak self, weak source] kind, body in
+            guard let self, let source else { return }
+            self.received(kind, body, from: source)
+        }
+        channel.onClose = { [weak self, weak source] _ in
+            DispatchQueue.main.async {
+                guard let self, let source else { return }
+                self.closed(source)
+            }
+        }
+        sources.append(source)
+        updateDisconnectedSleep()
+        log("sender connected from \(connection.endpoint)")
+        if active == nil {
+            cursorOverlay.reset()
+            lastStatus = nil
+            active = source
+            source.setShown(true)
+            if !streaming { splash.show(.connected(nil)) }
+        }
+        channel.start()
+    }
+
+    /// A message from one of the Macs, on the network queue. Frames are drawn here; most of the
+    /// rest is handled on the main thread, and only for the Mac that's shown.
+    private func received(_ kind: Wire.Kind, _ body: Data, from source: Source) {
+        let channel = source.channel
+        /// On the main thread, if this Mac is (still) the one shown.
+        func ifShown(_ work: @escaping () -> Void) {
+            DispatchQueue.main.async { if self.active === source { work() } }
+        }
+        switch kind {
+        case .frame:
+            let (draw, first) = source.frameArrived()
+            guard draw else {
+                // Sent before it heard it isn't shown. Acknowledged, so it isn't left waiting.
+                if body.count >= 4 { channel.send(.ack, body.prefix(4)) }
                 return
             }
-            if kind == .power {
-                guard let power = body.first.flatMap(Wire.Power.init) else { return }
-                if power == .sleep { showing = false }
-                DispatchQueue.main.async { self.macPower(power) }
-                return
-            }
-            if kind == .about {
-                guard let peer = Peer(body) else { return }
-                DispatchQueue.main.async { self.met(peer) }
-                return
-            }
-            if kind == .features {
-                let features = body.count >= 2 ? Wire.Capabilities(rawValue: body.readLE(UInt16.self, at: 0)) : []
-                DispatchQueue.main.async {
-                    guard self.channel === channel else { return }
-                    self.senderTakesFiles = features.contains(.files)
-                    self.senderCanSwap = features.contains(.swap)
-                }
-                return
-            }
-            if kind == .settings {
-                DispatchQueue.main.async {
-                    self.sendSettings()
-                    // And again if a setting kept by macOS turns out to have changed.
-                    MonitorMode.refresh { [weak self] in self?.sendSettings() }
-                }
-                return
-            }
-            if kind == .settingsChoice {
-                guard let choice = try? JSONDecoder().decode(RemoteMenu.Choice.self, from: body) else { return }
-                DispatchQueue.main.async { self.chooseSetting(choice) }
-                return
-            }
-            if kind == .peek {
-                guard let command = body.first.flatMap(Wire.Peek.init) else { return }
-                DispatchQueue.main.async {
-                    guard self.channel === channel else { return }
-                    self.peek.macAsked(command)
-                }
-                return
-            }
-            if kind == .input {
-                if let input = InputEvent(body) { self.peek.play(input) }
-                return
-            }
-            if kind == .swap {
-                guard body.first == Wire.Swap.now.rawValue else { return }
-                DispatchQueue.main.async {
-                    guard self.channel === channel, Role.canExtend else { return }
-                    log("\(self.peerKind) asked to swap roles, extending this Mac")
-                    Role.switchTo(.extend)
-                }
-                return
-            }
-            if kind == .inputState {
-                guard let state = body.first.flatMap(Wire.InputState.init) else { return }
-                DispatchQueue.main.async { self.input.macState = state }
-                return
-            }
-            if kind == .cursor {
-                guard let position = CursorPosition(body) else { return }
-                DispatchQueue.main.async { self.cursorOverlay.setPosition(position) }
-                return
-            }
-            if kind == .cursorShape {
-                guard let shape = CursorShape(body) else { return }
-                DispatchQueue.main.async { self.cursorOverlay.setShape(shape) }
-                return
-            }
-            if kind == .probe {
-                var size = Data()
-                size.appendLE(UInt32(body.count))
-                channel?.send(.probeAck, size)
-                return
-            }
-            if kind == .display {
-                guard let state = DisplayState(body) else { return }
-                self.renderer.setColorMatrix(state.colorMatrix)
-                if state.brightness >= 0 && self.options.windowedSize == nil {
-                    DispatchQueue.main.async {
-                        self.wantedBrightness = state.brightness
-                        BuiltInBrightness.set(state.brightness)
-                    }
-                }
-                return
-            }
-            guard kind == .frame else { return }
-            if !showing {
-                showing = true
-                DispatchQueue.main.async {
-                    guard self.channel === channel else { return }
+            if first {
+                ifShown {
+                    source.status = nil
                     self.streaming = true
                     self.startedStreaming()
                 }
             }
-            self.renderer.apply(body, presented: { frameNo in
+            renderer.apply(body, presented: { frameNo in
                 var ack = Data()
                 ack.appendLE(frameNo)
-                channel?.send(.ack, ack)
+                channel.send(.ack, ack)
             }, rejected: {
                 // The sender starts again with a whole frame, rather than wait for an answer.
-                channel?.cancel()
+                channel.cancel()
             })
-        }
-        channel.onClose = { [weak self, weak channel] _ in
+        case .status:
+            source.pictureStopped()
+            let text = String(decoding: body, as: UTF8.self)
+            log("status from sender: \(text)")
             DispatchQueue.main.async {
-                guard let self, let channel, self.channel === channel else { return }
-                self.channel = nil
-                self.senderCanSwap = false
-                self.senderTakesFiles = false
-                self.peek.pictureStopped()
-                self.updateDisconnectedSleep()
-                self.streaming = false
-                self.renderer.setColorMatrix(DisplayState.identity)
-                self.input.macState = .off
-                log("sender disconnected")
-                self.stoppedStreaming()
+                source.status = text
+                if self.active === source { self.senderStatus(text) }
+            }
+        case .power:
+            guard let power = body.first.flatMap(Wire.Power.init) else { return }
+            if power == .sleep { source.pictureStopped() }
+            DispatchQueue.main.async { self.power(power, from: source) }
+        case .about:
+            guard let peer = Peer(body) else { return }
+            DispatchQueue.main.async { self.met(peer, source) }
+        case .features:
+            let features = body.count >= 2 ? Wire.Capabilities(rawValue: body.readLE(UInt16.self, at: 0)) : []
+            DispatchQueue.main.async {
+                source.takesFiles = features.contains(.files)
+                source.canSwap = features.contains(.swap)
+            }
+        case .settings:
+            DispatchQueue.main.async {
+                self.sendSettings(to: source)
+                // And again if a setting kept by macOS turns out to have changed.
+                MonitorMode.refresh { [weak self] in self?.sendSettings() }
+            }
+        case .settingsChoice:
+            guard let choice = try? JSONDecoder().decode(RemoteMenu.Choice.self, from: body) else { return }
+            DispatchQueue.main.async { self.chooseSetting(choice) }
+        case .peek:
+            guard let command = body.first.flatMap(Wire.Peek.init) else { return }
+            ifShown { self.peek.macAsked(command) }
+        case .input:
+            if source.isShown, let input = InputEvent(body) { peek.play(input) }
+        case .swap:
+            guard body.first == Wire.Swap.now.rawValue else { return }
+            ifShown {
+                // Not with another Mac connected too, which would lose its display.
+                guard Role.canExtend, self.sources.count == 1 else { return }
+                log("\(self.peerKind) asked to swap roles, extending this Mac")
+                Role.switchTo(.extend)
+            }
+        case .inputState:
+            guard let state = body.first.flatMap(Wire.InputState.init) else { return }
+            DispatchQueue.main.async {
+                source.inputState = state
+                if self.active === source { self.input.macState = state }
+            }
+        case .cursor:
+            guard let position = CursorPosition(body) else { return }
+            DispatchQueue.main.async {
+                source.cursorPosition = position
+                if self.active === source { self.cursorOverlay.setPosition(position) }
+            }
+        case .cursorShape:
+            guard let shape = CursorShape(body) else { return }
+            DispatchQueue.main.async {
+                source.cursorShape = shape
+                if self.active === source { self.cursorOverlay.setShape(shape) }
+            }
+        case .probe:
+            var size = Data()
+            size.appendLE(UInt32(body.count))
+            channel.send(.probeAck, size)
+        case .display:
+            guard let state = DisplayState(body) else { return }
+            DispatchQueue.main.async {
+                source.display = state
+                if self.active === source { self.applyDisplay(state) }
+            }
+        case .show:
+            guard let request = body.first.flatMap(Wire.Show.init) else { return }
+            let number = body.count > 1 ? Int(body[body.startIndex + 1]) : 0
+            DispatchQueue.main.async {
+                log("\(source.name) asked to show \(request == .number ? "Mac \(number)" : "\(request)")")
+                _ = self.switchKey(request, number)
+            }
+        case .hello, .ack, .ping, .probeAck, .cameraFrame, .file, .lineup:
+            break
+        }
+    }
+
+    /// The brightness and colour a Mac asked for, now that it's shown.
+    private func applyDisplay(_ state: DisplayState) {
+        renderer.setColorMatrix(state.colorMatrix)
+        guard state.brightness >= 0, options.windowedSize == nil else { return }
+        wantedBrightness = state.brightness
+        BuiltInBrightness.set(state.brightness)
+    }
+
+    private func closed(_ source: Source) {
+        guard let index = sources.firstIndex(where: { $0 === source }) else { return }
+        sources.remove(at: index)
+        updateDisconnectedSleep()
+        log("\(source.name) disconnected")
+        guard active === source else { return sendLineup() }
+        if let next = nextToShow() {
+            return show(next, clearing: true, reason: "\(source.name) disconnected")
+        }
+        active = nil
+        source.setShown(false)
+        peek.pictureStopped()
+        streaming = false
+        renderer.setColorMatrix(DisplayState.identity)
+        input.macState = .off
+        log("sender disconnected")
+        stoppedStreaming()
+    }
+
+    /// When the shown Mac goes: one with a picture to show, if there is one.
+    private func nextToShow() -> Source? {
+        let others = sources.filter { $0 !== active }
+        return others.first { $0.hasPicture && $0.name == chosenMac } ?? others.first { $0.hasPicture } ?? others.first
+    }
+
+    // MARK: Switching Macs
+
+    /// ⌃⌥ with a number or an arrow, on this Mac's keyboard or one of the others'. Only with more
+    /// than one Mac connected; otherwise false, and the keys carry on as usual.
+    private func switchKey(_ request: Wire.Show, _ number: Int) -> Bool {
+        let macs = sources.filter { $0.number > 0 }.sorted { $0.number < $1.number }
+        guard macs.count > 1 else { return false }
+        let target: Source?
+        switch request {
+        case .number:
+            target = macs.first { $0.number == number }
+            if target == nil {
+                let name = MacNumbers.name(of: number)
+                hud.show(name.map { "\($0) isn't connected" } ?? "There's no Mac \(number)", shortcutHint(macs))
+                return true
+            }
+        case .next, .previous:
+            let at = macs.firstIndex { $0 === active } ?? (request == .next ? -1 : 0)
+            target = macs[(at + (request == .next ? 1 : -1) + macs.count) % macs.count]
+        }
+        guard let target else { return true }
+        chosenMac = target.name
+        if target === active {
+            hud.show(target.name, shortcutHint(macs))
+        } else {
+            show(target)
+        }
+        return true
+    }
+
+    /// "⌃⌥1 MacBook Pro   ⌃⌥2 Mac mini", or with their names if they're the same kind of Mac.
+    private func shortcutHint(_ macs: [Source]) -> String {
+        let byKind = Set(macs.map(\.kind)).count == macs.count
+        return macs.map { "⌃⌥\($0.number)  \(byKind ? $0.kind : $0.name)" }.joined(separator: "     ")
+    }
+
+    /// Shows another Mac. Its picture replaces the last one's as soon as it arrives; with
+    /// `clearing`, the screen goes dark until then (the last Mac has gone). The HUD names it, and
+    /// says why if it wasn't asked for.
+    private func show(_ source: Source, clearing: Bool = false, reason: String? = nil, quietly: Bool = false) {
+        guard source !== active, sources.contains(where: { $0 === source }) else { return }
+        if let old = active {
+            log("showing \(source.name) instead of \(old.name)")
+            // Keys held to switch, say, would otherwise stay down there.
+            if input.engaged { old.channel.send(.input, InputEvent(type: InputEvent.releaseAll).encoded()) }
+            old.setShown(false)
+        } else {
+            log("showing \(source.name)")
+        }
+        peek.pictureStopped()
+        active = source
+        source.setShown(true)
+        streaming = false
+        if let peer = source.peer { showingPeer(peer) }
+        cursorOverlay.isActive = false
+        cursorOverlay.reset()
+        if let shape = source.cursorShape { cursorOverlay.setShape(shape) }
+        if let position = source.cursorPosition { cursorOverlay.setPosition(position) }
+        applyDisplay(source.display ?? DisplayState(colorMatrix: DisplayState.identity))
+        // Carries on controlling the newly shown Mac, if it takes the keyboard and mouse.
+        input.macState = source.inputState
+        if clearing { renderer.clear() }
+        lastStatus = source.status
+        if asleepWithMac && !source.asleep {
+            IOPMAssertionDeclareUserActivity("Tandem: showing another Mac" as CFString, kIOPMUserActiveLocal, &activityAssertion)
+            setAsleepWithMac(false)
+        }
+        if let status = source.status {
+            senderStatus(status)
+        } else if source.asleep {
+            // Like a key pressed on its keyboard.
+            source.channel.send(.power, Data([Wire.Power.wake.rawValue]))
+            splash.show(.asleep)
+        } else if clearing {
+            splash.show(.connected(nil))
+        }
+        if !source.hasPicture || clearing { input.available = false; setCursorHidden(false) }
+        sendLineup()
+        let macs = sources.filter { $0.number > 0 }.sorted { $0.number < $1.number }
+        if !quietly { hud.show(source.name, reason ?? (macs.count > 1 ? shortcutHint(macs) : "")) }
+        // If no picture comes, say so rather than leave the last Mac's up.
+        pictureCheck?.cancel()
+        let check = DispatchWorkItem { [weak self, weak source] in
+            guard let self, let source, self.active === source, !self.streaming, source.hasPicture else { return }
+            log("no picture from \(source.name) yet")
+            self.input.available = false
+            self.setCursorHidden(false)
+            self.splash.show(.connected(nil))
+        }
+        pictureCheck = check
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: check)
+    }
+
+    /// Tells each Mac which Macs are connected and which is shown: the ones not shown stop
+    /// sending, and each lists the others in its Tandem menu.
+    private func sendLineup(to only: Source? = nil) {
+        // To everyone once, however many changes come together.
+        if only == nil {
+            guard !lineupQueued else { return }
+            lineupQueued = true
+            return DispatchQueue.main.async {
+                self.lineupQueued = false
+                self.sendLineupNow()
             }
         }
-        self.channel = channel
-        updateDisconnectedSleep()
-        lastStatus = nil
-        if !streaming { splash.show(.connected(nil)) }
-        log("sender connected from \(connection.endpoint)")
-        channel.start()
+        sendLineupNow(to: only)
+    }
+    private var lineupQueued = false
+
+    private func sendLineupNow(to only: Source? = nil) {
+        for source in only.map({ [$0] }) ?? sources {
+            // Each Mac once it has said who it is, and always the one it's sent to.
+            let macs = sources.filter { $0.number > 0 || $0 === source }
+            let lineup = Lineup(macs: macs.map {
+                Lineup.Mac(name: $0.name, number: $0.number, shown: $0 === active, you: $0 === source)
+            })
+            guard let data = try? JSONEncoder().encode(lineup) else { continue }
+            source.channel.send(.lineup, data)
+        }
+    }
+
+    /// A Mac going to sleep or waking. If the shown one sleeps while another is awake, the other
+    /// is shown; a Mac waking is shown if the one shown has nothing to show.
+    private func power(_ power: Wire.Power, from source: Source) {
+        source.asleep = power == .sleep
+        if active === source {
+            if power == .sleep, let other = sources.first(where: { $0 !== source && $0.hasPicture }) {
+                log("\(source.name) went to sleep, showing \(other.name)")
+                return show(other, clearing: true, reason: "\(source.name) went to sleep")
+            }
+            return macPower(power)
+        }
+        guard power == .wake, let active else { return }
+        if !active.hasPicture {
+            log("\(source.name) woke while \(active.name) is asleep")
+            show(source, clearing: true, reason: "\(active.name) is asleep")
+        } else if source.name == chosenMac && active.name != chosenMac {
+            // The Mac last chosen, back from sleep: shown again, as when it connects again.
+            log("\(source.name) woke, and was the Mac last chosen")
+            show(source)
+        }
     }
 
     /// The sender explaining why there's no picture, e.g. missing permission or paused.
@@ -706,14 +935,17 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     /// This whole Mac is going to sleep, from its power button or the Apple menu. It's about to
     /// drop off the link, so say goodbye rather than leave the other Mac waiting on a silent cable.
     private func willSleep() {
-        guard let channel else { return }
+        guard !sources.isEmpty else { return }
         log("going to sleep")
         input.available = false
-        let sent = DispatchSemaphore(value: 0)
-        channel.send(.power, Data([Wire.Power.sleep.rawValue])) { sent.signal() }
-        // macOS sleeps as soon as observers return, so get the message out first.
+        let sent = DispatchGroup()
+        for source in sources {
+            sent.enter()
+            source.channel.send(.power, Data([Wire.Power.sleep.rawValue])) { sent.leave() }
+        }
+        // macOS sleeps as soon as observers return, so get the messages out first.
         _ = sent.wait(timeout: .now() + 0.5)
-        channel.cancel()
+        sources.forEach { $0.channel.cancel() }
     }
 
     /// Only the screen sleeps. If this whole Mac slept, it would drop off the Thunderbolt
@@ -726,7 +958,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     /// The sleep countdown only runs while no Mac is connected, and not while the other Mac is
     /// asleep: it will wake this one, which it can't do once this one sleeps too.
     private func updateDisconnectedSleep() {
-        disconnectedSleep?.paused = channel != nil || asleepWithMac
+        disconnectedSleep?.paused = !sources.isEmpty || asleepWithMac
     }
 
     private func startedStreaming() {

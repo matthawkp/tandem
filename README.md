@@ -49,6 +49,12 @@ Described for the common case, a MacBook extending onto an iMac.
   drops off the Thunderbolt link and couldn't be woken over it. Both Macs can open Tandem at login,
   and the iMac can start up after a power cut.
 - **Swap roles** from either Mac's menu, and the iMac's settings appear in the MacBook's menu.
+- **Two Macs, one iMac.** Connect a Mac to each of the iMac's Thunderbolt ports and switch
+  between them like the inputs of a monitor: ⌃⌥1 and ⌃⌥2, or ⌃⌥← and ⌃⌥→, on any of the
+  keyboards, or from the Tandem menu. The Mac not shown keeps its display, so its windows stay
+  put, but sends nothing until it's shown again. The iMac's keyboard and mouse follow the Mac
+  shown. Each Mac keeps its number, and if the Mac shown disconnects or sleeps, the other is
+  shown. The keys only switch while two Macs are connected; otherwise they're left alone.
 
 ## Requirements
 
