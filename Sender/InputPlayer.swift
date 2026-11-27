@@ -44,6 +44,9 @@ final class InputPlayer {
     /// The pointer may be hidden: macOS hides it while you type, until the mouse moves, and only
     /// counts real mice. Set when input starts and after typing.
     private var pointerMayBeHidden = true
+    /// The last pointer position posted here and when, so rapid moves build on each other before
+    /// the window server catches up.
+    private var postedPointer: (point: CGPoint, time: UInt64)?
     private var activityAssertion: IOPMAssertionID = 0
     private var lastActivity = DispatchTime(uptimeNanoseconds: 0)
 
@@ -102,6 +105,7 @@ final class InputPlayer {
             event.setDoubleValueField(.mouseEventDeltaX, value: dx)
             event.setDoubleValueField(.mouseEventDeltaY, value: dy)
             event.post(tap: .cghidEventTap)
+            postedPointer = (to, DispatchTime.now().uptimeNanoseconds)
 
         case .leftMouseDown, .leftMouseUp, .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp:
             guard let button: UInt32 = input.integer(CGEventField.mouseEventButtonNumber.rawValue) else { return }
@@ -237,6 +241,7 @@ final class InputPlayer {
                     mouseButton: CGMouseButton(rawValue: UInt32(button)) ?? .center)?.post(tap: .cghidEventTap)
         }
         buttonsDown.removeAll()
+        postedPointer = nil
         if let modifiers = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false) {
             modifiers.type = .flagsChanged
             modifiers.flags = []
@@ -244,7 +249,16 @@ final class InputPlayer {
         }
     }
 
-    private var pointer: CGPoint { CGEvent(source: nil)?.location ?? .zero }
+    /// Where the pointer is, or where a move here sent it inside the last 100 ms. `CGEvent.post`
+    /// is asynchronous, so reading from the window server before it catches up would snap a burst
+    /// of moves or a quick click back to an older spot; reading again after a pause picks up this
+    /// Mac's own trackpad or a warp elsewhere in the app.
+    private var pointer: CGPoint {
+        if let posted = postedPointer, DispatchTime.now().uptimeNanoseconds - posted.time < 100_000_000 {
+            return posted.point
+        }
+        return CGEvent(source: nil)?.location ?? .zero
+    }
 
     /// Moves the pointer like a mouse would: across any screen, stopping at the outer edges.
     private func movedPointer(by dx: Double, _ dy: Double) -> CGPoint {

@@ -723,6 +723,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
     /// The brightness and colour a Mac asked for, now that it's shown.
     private func applyDisplay(_ state: DisplayState) {
         renderer.setColorMatrix(state.colorMatrix)
+        cursorOverlay.setColorMatrix(state.colorMatrix)
         guard state.brightness >= 0, options.windowedSize == nil else { return }
         wantedBrightness = state.brightness
         BuiltInBrightness.set(state.brightness)
@@ -742,6 +743,7 @@ final class ReceiverApp: NSObject, NSApplicationDelegate {
         peek.pictureStopped()
         streaming = false
         renderer.setColorMatrix(DisplayState.identity)
+        cursorOverlay.setColorMatrix(DisplayState.identity)
         input.macState = .off
         log("sender disconnected")
         stoppedStreaming()
